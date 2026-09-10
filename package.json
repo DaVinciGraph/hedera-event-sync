@@ -1,0 +1,82 @@
+{
+	"name": "@davincigraph/hedera-event-sync",
+	"version": "1.0.0",
+	"private": false,
+	"description": "A type-safe, provider-agnostic Hedera Mirror Node event and transaction synchronization engine.",
+	"license": "MIT",
+	"author": "DaVinciGraph",
+	"keywords": [
+		"hedera",
+		"mirror-node",
+		"events",
+		"transactions",
+		"indexer",
+		"sync",
+		"typescript"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/DaVinciGraph/hedera-event-sync.git"
+	},
+	"bugs": {
+		"url": "https://github.com/DaVinciGraph/hedera-event-sync/issues"
+	},
+	"homepage": "https://github.com/DaVinciGraph/hedera-event-sync#readme",
+	"engines": {
+		"node": ">=18"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"sideEffects": false,
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./types/config": {
+			"types": "./dist/types/config.d.ts",
+			"import": "./dist/types/config.js"
+		},
+		"./types/domain": {
+			"types": "./dist/types/domain.d.ts",
+			"import": "./dist/types/domain.js"
+		},
+		"./core/logs/LogEventProcessor": {
+			"types": "./dist/core/logs/LogEventProcessor.d.ts",
+			"import": "./dist/core/logs/LogEventProcessor.js"
+		}
+	},
+	"files": [
+		"dist",
+		"docs",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+		"build": "tsup",
+		"test": "node ./test/run-tests.mjs",
+		"test:coverage": "c8 --all --include=src/**/*.ts --check-coverage --lines=80 --statements=80 --functions=75 --branches=65 npm test",
+		"test:e2e": "node ./test/e2e.public-mirror.mjs",
+		"test:package": "node ./test/package-smoke.mjs && tsc -p tsconfig.package-test.json",
+		"prepack": "npm run typecheck && npm run test:coverage && npm run build && npm run test:package"
+	},
+	"dependencies": {
+		"@davincigraph/hedera-rest-client": "^1.0.0",
+		"abitype": "^1.3.0",
+		"ox": "^0.14.44",
+		"viem": "^2.56.3"
+	},
+	"devDependencies": {
+		"@types/node": "^22.5.4",
+		"c8": "10.1.3",
+		"esbuild": "0.27.2",
+		"tsup": "8.5.1",
+		"tsx": "4.23.13",
+		"typescript": "5.5.4"
+	}
+}
