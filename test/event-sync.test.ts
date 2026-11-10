@@ -36,11 +36,21 @@ function transactionQuery(id = 100): Extract<QueryConfig, { type: "Transactions"
 	};
 }
 
+async function fixture(options: Omit<Parameters<typeof HederaEventSync.create>[0], "querySource"> = { restClient: {} as HederaRestClient, singletonGuard: false }) {
+	let catalog: readonly QueryConfig[] = [];
+	const sync = await HederaEventSync.create({ ...options, querySource: () => catalog });
+	return { sync, async load(...queries: QueryConfig[]) {
+		catalog = queries;
+		if (sync.getLifecycleState().started) await sync.reloadQueries();
+		else await sync.start();
+	} };
+}
+
 describe("HederaEventSync lifecycle", () => {
 	it("resolves defaults, protects internal state, and rejects duplicate ids", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const input = query();
-		await sync.addQuery(input);
+		await load(input);
 		input.title = "mutated input";
 		const resolved = sync.getQuery(1)!;
 		assert.equal(resolved.read.fetch.pollIntervalSeconds, 30);
@@ -50,14 +60,14 @@ describe("HederaEventSync lifecycle", () => {
 
 		resolved.title = "mutated snapshot";
 		assert.equal(sync.getQuery(1)?.title, "query 1");
-		await assert.rejects(sync.addQuery(query()), /already exists/);
+		await assert.rejects(load(query(), query()), /occurs more than once/);
 		await sync.shutdown();
 	});
 
 	it("updates hooks already held by running query runtimes", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		let statusChanges = 0;
-		await sync.addQuery(query());
+		await load(query());
 		sync.setHooks({ onQueryStatusChange: () => void statusChanges++ });
 		await sync.pauseRead(1);
 		assert.ok(statusChanges > 0);
@@ -65,27 +75,27 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("announces a query before initializing its read loop", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const events: string[] = [];
 		sync.setHooks({
 			onQueryAdded: () => void events.push("added"),
 			onReadInit: () => void events.push("read-init"),
 		});
-		await sync.addQuery(query(30));
+		await load(query(30));
 		assert.deepEqual(events.slice(0, 2), ["added", "read-init"]);
 		await sync.shutdown();
 	});
 
 	it("rejects invalid runtime values before starting a query", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const invalid = query();
 		invalid.read.fetch.batchSize = Number.NaN;
-		await assert.rejects(sync.addQuery(invalid), /batchSize/);
+		await assert.rejects(load(invalid), /batchSize/);
 		await sync.shutdown();
 	});
 
-	it("rejects malformed event ABI items during add and update", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+	it("rejects malformed event ABI items during start and reload", async () => {
+		const { sync, load } = await fixture();
 		const malformedEvents: unknown[] = [
 			{ type: "event", anonymous: false, inputs: [] },
 			{ type: "event", anonymous: false, name: "MissingInputs" },
@@ -97,7 +107,7 @@ describe("HederaEventSync lifecycle", () => {
 		for (let index = 0; index < malformedEvents.length; index++) {
 			const invalid = query(70 + index);
 			invalid.abi = [malformedEvents[index], ...abi] as unknown as Abi;
-			await assert.rejects(sync.addQuery(invalid), /malformed event ABI item at index 0/);
+			await assert.rejects(load(invalid), /malformed event ABI item at index 0/);
 		}
 
 		const validWithNonEventItem = query(73);
@@ -105,18 +115,18 @@ describe("HederaEventSync lifecycle", () => {
 			{ type: "function", name: "ping", stateMutability: "view", inputs: [], outputs: [] },
 			...abi,
 		] as const satisfies Abi;
-		await sync.addQuery(validWithNonEventItem);
+		await load(validWithNonEventItem);
 
 		const invalidUpdate = query(73);
 		invalidUpdate.abi = [{ type: "event", anonymous: false, name: "InvalidType", inputs: [{ type: "notatype" }] }] as unknown as Abi;
-		await assert.rejects(sync.updateQuery(invalidUpdate), /malformed event ABI item at index 0/);
+		await assert.rejects(load(invalidUpdate), /malformed event ABI item at index 0/);
 		assert.equal(sync.getQuery(73)?.title, "query 73");
 
 		await sync.shutdown();
 	});
 
 	it("contains opaque ABI-validation failures inside a descriptive Error", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const thrown = Proxy.revocable({}, {});
 		thrown.revoke();
 		const hostileEvent = {
@@ -131,17 +141,17 @@ describe("HederaEventSync lifecycle", () => {
 		invalid.abi = [hostileEvent] as unknown as Abi;
 
 		await assert.rejects(
-			sync.addQuery(invalid),
+			load(invalid),
 			/malformed event ABI item at index 0: \[unserializable thrown value\]/i
 		);
 		await sync.shutdown();
 	});
 
 	it("accepts repeated topic filters in any Mirror Node topic position", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const independentTopics = query(6);
 		independentTopics.params.topics = [undefined, ["0x2", "0x22"]];
-		await sync.addQuery(independentTopics);
+		await load(independentTopics);
 		const added = sync.getQuery(6);
 		assert.equal(added?.type, "Multi-Contract-Logs");
 		if (added?.type === "Multi-Contract-Logs") {
@@ -150,198 +160,55 @@ describe("HederaEventSync lifecycle", () => {
 		await sync.shutdown();
 	});
 
-	it("serializes concurrent query additions so an id can own only one runtime", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		const results = await Promise.allSettled([sync.addQuery(query(7)), sync.addQuery(query(7))]);
-		assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
-		assert.equal(results.filter((result) => result.status === "rejected").length, 1);
-		assert.equal(sync.listQueries().length, 1);
-		await sync.shutdown();
+	it("rejects a duplicate ID catalog before replacing the accepted generation", async () => {
+		const { sync, load } = await fixture();
+		try {
+			await load(transactionQuery(1));
+			await assert.rejects(load(transactionQuery(2), transactionQuery(2)), /occurs more than once/);
+			assert.deepEqual(sync.listQueries().map(item => item.id), [1]);
+			assert.equal(sync.getReadStatus(1)?.status.name, "RUNNING");
+		} finally { await sync.shutdown(); }
 	});
 
-	it("rejects a duplicate add using the captured ID when the caller mutates its input", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(transactionQuery(1));
-		const originalRuntime = (sync as unknown as { queries: Map<number, { stop(): Promise<void> }> }).queries.get(1)!;
+	it("clones the accepted source catalog so later caller mutation cannot change it", async () => {
+		const input = transactionQuery(1);
+		const { sync, load } = await fixture();
 		try {
-			const input = transactionQuery(1);
-			input.params.accountId = "0.0.456";
-			const addition = sync.addQuery(input);
+			await load(input);
 			input.id = 2;
-
-			await assert.rejects(addition, /Query 1 already exists/);
-			const original = sync.getQuery(1);
-			assert.ok(original?.type === "Transactions");
-			assert.equal(original.params.accountId, "0.0.123");
+			input.params.accountId = "0.0.456";
+			await sync.restartQueries();
+			const current = sync.getQuery(1);
+			assert.ok(current?.type === "Transactions");
+			assert.equal(current.params.accountId, "0.0.123");
 			assert.equal(sync.getQuery(2), undefined);
-		} finally {
-			await sync.shutdown();
-			// Also stop the original if a regression overwrites and orphans it.
-			await originalRuntime.stop();
-		}
-	});
-
-	it("adds the captured query ID when the caller reuses its input for an existing ID", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		try {
-			await sync.addQuery(transactionQuery(2));
-			const input = transactionQuery(1);
-			input.params.accountId = "0.0.456";
-			const addition = sync.addQuery(input);
-			input.id = 2;
-
-			await addition;
-			const added = sync.getQuery(1);
-			const existing = sync.getQuery(2);
-			assert.ok(added?.type === "Transactions");
-			assert.ok(existing?.type === "Transactions");
-			assert.equal(added.params.accountId, "0.0.456");
-			assert.equal(existing.params.accountId, "0.0.123");
-		} finally {
-			await sync.shutdown();
-		}
-	});
-
-	it("updates only the captured query ID when the caller mutates its input", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(transactionQuery(1));
-		const other = transactionQuery(2);
-		other.params.accountId = "0.0.456";
-		await sync.addQuery(other);
-		const originalRuntime = (sync as unknown as { queries: Map<number, { stop(): Promise<void> }> }).queries.get(1)!;
-		const removed: number[] = [];
-		sync.setHooks({ onQueryRemoved: (query) => void removed.push(query.id) });
-		try {
-			const input = transactionQuery(1);
-			input.params.accountId = "0.0.789";
-			const update = sync.updateQuery(input);
-			input.id = 2;
-
-			await update;
-			assert.deepEqual([...removed], [1]);
-			const updated = sync.getQuery(1);
-			const unchanged = sync.getQuery(2);
-			assert.ok(updated?.type === "Transactions");
-			assert.ok(unchanged?.type === "Transactions");
-			assert.equal(updated.params.accountId, "0.0.789");
-			assert.equal(unchanged.params.accountId, "0.0.456");
-			assert.equal(sync.getReadStatus(2)?.status.name, "RUNNING");
-			assert.equal(sync.getQueueStatus(2)?.status.name, "RUNNING");
-		} finally {
-			await sync.shutdown();
-			// Also stop the original if a regression replaces it without stopping it.
-			await originalRuntime.stop();
-		}
-	});
-
-	it("keeps a missing update ID missing when the caller changes it to an existing ID", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		try {
-			await sync.addQuery(transactionQuery(2));
-			const input = transactionQuery(1);
-			input.params.accountId = "0.0.456";
-			const update = sync.updateQuery(input);
-			input.id = 2;
-
-			await assert.rejects(update, /Query 1 not found/);
-			assert.equal(sync.getQuery(1), undefined);
-			assert.equal(sync.getReadStatus(2)?.status.name, "RUNNING");
-			assert.equal(sync.getQueueStatus(2)?.status.name, "RUNNING");
-		} finally {
-			await sync.shutdown();
-		}
-	});
-
-	it("excludes the captured ID from duplicate checks when the caller mutates its update input", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(transactionQuery(1));
-		const originalRuntime = (sync as unknown as { queries: Map<number, { stop(): Promise<void> }> }).queries.get(1)!;
-		try {
-			const other = transactionQuery(2);
-			other.params.accountId = "0.0.456";
-			await sync.addQuery(other);
-			const input = transactionQuery(1);
-			input.title = "updated title";
-			const update = sync.updateQuery(input);
-			input.id = 2;
-
-			await update;
-			assert.equal(sync.getQuery(1)?.title, "updated title");
-			assert.equal(sync.getQuery(2)?.title, "transaction query 2");
-		} finally {
-			await sync.shutdown();
-			await originalRuntime.stop();
-		}
+		} finally { await sync.shutdown(); }
 	});
 
 	for (const sparseFirst of [true, false]) {
-		const order = sparseFirst ? "sparse first" : "sparse second";
-		const sparseTopics: ContractLogTopicsFilter = [, "0x1"];
-		const restrictedTopics: ContractLogTopicsFilter = ["0x2", "0x1"];
-
-		it(`keeps distinct topic filters when adding queries (${order})`, async () => {
-			const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		it(`retains distinct IDs and sparse topic positions (${sparseFirst ? "sparse first" : "sparse second"})`, async () => {
+			const { sync, load } = await fixture();
 			try {
-				const first = query(1);
-				const second = query(2);
-				first.params.topics = sparseFirst ? sparseTopics : restrictedTopics;
-				second.params.topics = sparseFirst ? restrictedTopics : sparseTopics;
-				await sync.addQuery(first);
-				await sync.addQuery(second);
-				assert.deepEqual(sync.listQueries().map((item) => item.id), [1, 2]);
-			} finally {
-				await sync.shutdown();
-			}
-		});
-
-		it(`keeps distinct topic filters when updating queries (${order})`, async () => {
-			const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-			try {
-				const first = query(1);
-				first.params.topics = sparseFirst ? sparseTopics : restrictedTopics;
-				await sync.addQuery(first);
-				await sync.addQuery(query(2));
-				const replacement = query(2);
-				replacement.params.topics = sparseFirst ? restrictedTopics : sparseTopics;
-				await sync.updateQuery(replacement);
-				const updated = sync.getQuery(2);
-				assert.equal(updated?.type, "Multi-Contract-Logs");
-				if (updated?.type === "Multi-Contract-Logs") {
-					assert.deepEqual(updated.params.topics, replacement.params.topics);
-				}
-			} finally {
-				await sync.shutdown();
-			}
-		});
-
-		it(`treats empty topic positions as undefined during duplicate checks (${order})`, async () => {
-			const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-			try {
-				const explicitTopics: ContractLogTopicsFilter = [undefined, "0x1"];
-				const first = query(1);
-				const duplicate = query(2);
-				first.params.topics = sparseFirst ? sparseTopics : explicitTopics;
-				duplicate.params.topics = sparseFirst ? explicitTopics : sparseTopics;
-				await sync.addQuery(first);
-				await sync.addQuery(duplicate);
-				assert.equal(sync.getQuery(2), undefined);
-
-				await sync.addQuery(query(2));
-				const beforeUpdate = sync.getQuery(2);
-				await sync.updateQuery(duplicate);
-				assert.deepEqual(sync.getQuery(2), beforeUpdate);
-			} finally {
-				await sync.shutdown();
-			}
+				const first = query(1), second = query(2);
+				first.params.topics = sparseFirst ? [, "0x1"] : ["0x2", "0x1"];
+				second.params.topics = sparseFirst ? ["0x2", "0x1"] : [, "0x1"];
+				await load(first, second);
+				assert.deepEqual(sync.listQueries().map(item => item.id), [1, 2]);
+				const loaded = sync.getQuery(1);
+				assert.ok(loaded?.type === "Multi-Contract-Logs");
+				assert.deepEqual(loaded.params.topics, first.params.topics);
+				await sync.restartQueries();
+				assert.deepEqual(sync.listQueries().map(item => item.id), [1, 2]);
+			} finally { await sync.shutdown(); }
 		});
 	}
 
 	it("rejects reentrant lifecycle controls instead of deadlocking an active callback", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		let callbackError: unknown;
 		sync.setHooks({
 			async onQueryAdded(added) {
-				if (added.id === 40) await sync.addQuery(query(41));
+				if (added.id === 40) await sync.reloadQueries();
 			},
 			onHookError(failure) {
 				callbackError = failure.error;
@@ -351,7 +218,7 @@ describe("HederaEventSync lifecycle", () => {
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
 			await Promise.race([
-				sync.addQuery(query(40)),
+				load(query(40)),
 				new Promise<never>((_, reject) => {
 					timeout = setTimeout(() => reject(new Error("lifecycle operation deadlocked")), 500);
 				}),
@@ -364,69 +231,32 @@ describe("HederaEventSync lifecycle", () => {
 		await sync.shutdown();
 	});
 
-	it("allows an active hook to await independently scheduled work for another query", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+	it("rejects overlapping instance lifecycle work from an independent async context", async () => {
+		const { sync, load } = await fixture();
 		let releaseExternal!: () => void;
-		const externalSignal = new Promise<void>((resolve) => { releaseExternal = resolve; });
-		const externalAddition = externalSignal.then(() => sync.addQuery(query(42), false));
-		sync.setHooks({
-			async onQueryAdded(added) {
-				if (added.id !== 41) return;
-				releaseExternal();
-				await externalAddition;
-			},
-		});
-
-		let timeout: ReturnType<typeof setTimeout> | undefined;
-		try {
-			await Promise.race([
-				sync.addQuery(query(41)),
-				new Promise<never>((_, reject) => {
-					timeout = setTimeout(() => reject(new Error("independent lifecycle operation deadlocked")), 500);
-				}),
-			]);
-		} finally {
-			if (timeout) clearTimeout(timeout);
-		}
-		assert.ok(sync.getQuery(41));
-		assert.ok(sync.getQuery(42));
-		await sync.shutdown();
-	});
-
-	it("rejects same-query lifecycle work arriving through an independent async context", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		let releaseExternal!: () => void;
-		const externalSignal = new Promise<void>((resolve) => { releaseExternal = resolve; });
-		const externalRemoval = externalSignal.then(() => sync.removeQuery(43));
+		const externalSignal = new Promise<void>(resolve => { releaseExternal = resolve; });
+		const externalRestart = externalSignal.then(() => sync.restartQueries());
 		let callbackError: unknown;
-		sync.setHooks({
-			async onQueryAdded(added) {
-				if (added.id !== 43) return;
-				releaseExternal();
-				try {
-					await externalRemoval;
-				} catch (error) {
-					callbackError = error;
-				}
-			},
-		});
-
-		await sync.addQuery(query(43));
+		sync.setHooks({ async onQueryAdded() {
+			releaseExternal();
+			try { await externalRestart; } catch (error) { callbackError = error; }
+		} });
+		await load(query(43));
 		assert.ok(callbackError instanceof LifecycleBusyError);
 		assert.ok(sync.getQuery(43));
 		await sync.shutdown();
 	});
 
 	it("keeps callback activity isolated between synchronizer instances", async () => {
-		const first = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		const second = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync: first, load: loadFirst } = await fixture();
+		const { sync: second, load: loadSecond } = await fixture();
 		first.setHooks({
 			async onQueryAdded(added) {
-				if (added.id === 44) await second.addQuery(query(44));
+				if (added.id === 44) await loadSecond(query(44));
 			},
 		});
 
-		await first.addQuery(query(44));
+		await loadFirst(query(44));
 		assert.ok(first.getQuery(44));
 		assert.ok(second.getQuery(44));
 		await first.shutdown();
@@ -434,28 +264,28 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("updates and removes a query without exposing an incomplete replacement", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const events: string[] = [];
 		sync.setHooks({
 			onQueryAdded: (added) => void events.push(`added:${added.title}`),
 			onQueryRemoved: (removed) => void events.push(`removed:${removed.title}`),
 		});
-		await sync.addQuery(query(45));
+		await load(query(45));
 		const updated = query(45);
 		updated.title = "updated query";
 		updated.process.holdPeriod = "weekly";
-		await sync.updateQuery(updated);
+		await load(updated);
 
 		assert.equal(sync.getQuery(45)?.title, "updated query");
 		assert.deepEqual(events, ["added:query 45", "removed:query 45", "added:updated query"]);
-		await sync.removeQuery(45);
+		await load();
 		assert.equal(sync.getQuery(45), undefined);
 		assert.deepEqual(events, ["added:query 45", "removed:query 45", "added:updated query", "removed:updated query"]);
 		await sync.shutdown();
 	});
 
 	it("rejects shutdown immediately while an independently observed hook is active", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		let hookStarted!: () => void;
 		let releaseHook!: () => void;
 		const started = new Promise<void>((resolve) => { hookStarted = resolve; });
@@ -468,7 +298,7 @@ describe("HederaEventSync lifecycle", () => {
 			},
 		});
 
-		const addition = sync.addQuery(query(46));
+		const addition = load(query(46));
 		await started;
 		await assert.rejects(sync.shutdown(), LifecycleBusyError);
 		releaseHook();
@@ -477,18 +307,17 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("does not mistake queries with different processing behavior for duplicates", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const first = query(1);
 		const second = query(2);
 		second.process.holdPeriod = "weekly";
-		await sync.addQuery(first);
-		await sync.addQuery(second);
+		await load(first, second);
 		assert.equal(sync.listQueries().length, 2);
 		await sync.shutdown();
 	});
 
 	it("requires the canonical contract.address for single-contract log queries", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const canonicalAddress = "0.0.111";
 		const canonical = {
 			...query(50),
@@ -496,7 +325,7 @@ describe("HederaEventSync lifecycle", () => {
 			contract: { address: canonicalAddress },
 			params: { timestamp: "1" },
 		};
-		await sync.addQuery(canonical);
+		await load(canonical);
 
 		const stored = sync.getQuery(50);
 		assert.equal(stored?.type, "Single-Contract-Logs");
@@ -511,19 +340,19 @@ describe("HederaEventSync lifecycle", () => {
 			contract: undefined,
 			params: { contractAddress: canonicalAddress, timestamp: "1" },
 		} as unknown as QueryConfig;
-		await assert.rejects(sync.addQuery(missingCanonicalSource), /contract\.address is required/);
+		await assert.rejects(load(missingCanonicalSource), /contract\.address is required/);
 		assert.equal(sync.listQueries().length, 1);
 		await sync.shutdown();
 	});
 
 	it("requires params.accountId for transaction queries without deriving it from metadata", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const common = {
 			type: "Transactions" as const,
 			read: query().read,
 			process: { pauseAfterConsecutiveFailures: 3 },
 		};
-		await sync.addQuery({
+		await load({
 			...common,
 			id: 52,
 			title: "transaction source",
@@ -544,19 +373,19 @@ describe("HederaEventSync lifecycle", () => {
 			contract: { id: "0.0.333" },
 			params: { contractAddress: "0.0.111", timestamp: "1" },
 		} as unknown as QueryConfig;
-		await assert.rejects(sync.addQuery(missingAccountId), /accountId is required/);
+		await assert.rejects(load(missingAccountId), /accountId is required/);
 		assert.equal(sync.listQueries().length, 1);
 		await sync.shutdown();
 	});
 
-	it("canonicalizes execution defaults before duplicate checks", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(query(54));
+	it("canonicalizes execution defaults while retaining distinct source IDs", async () => {
+		const { sync, load } = await fixture();
+		const implicitLogDefaults = query(54);
 		const explicitLogDefaults = query(55);
 		explicitLogDefaults.params.index = 0;
 		explicitLogDefaults.process.skipEventNames = [];
-		await sync.addQuery(explicitLogDefaults);
-		assert.equal(sync.listQueries().length, 1);
+		await load(implicitLogDefaults, explicitLogDefaults);
+		assert.equal(sync.listQueries().length, 2);
 
 		const transaction = {
 			type: "Transactions" as const,
@@ -566,15 +395,14 @@ describe("HederaEventSync lifecycle", () => {
 			params: { accountId: "0.0.111", timestamp: "1" },
 			process: { pauseAfterConsecutiveFailures: 3 },
 		};
-		await sync.addQuery(transaction);
-		await sync.addQuery({
+		await load(implicitLogDefaults, explicitLogDefaults, transaction, {
 			...transaction,
 			id: 57,
 			title: "explicit transaction defaults",
 			params: { ...transaction.params, index: 0, result: "success" },
 			process: { ...transaction.process, skipTransactionTypes: [], unhandledTransactionPolicy: "error" },
 		});
-		assert.equal(sync.listQueries().length, 2);
+		assert.equal(sync.listQueries().length, 4);
 
 		const stored = sync.getQuery(56);
 		assert.equal(stored?.type, "Transactions");
@@ -586,9 +414,9 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("releases the guarded singleton when shut down", async () => {
-		const first = await HederaEventSync.create({ restClient: {} as HederaRestClient });
+		const first = await HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] });
 		await first.shutdown();
-		const second = await HederaEventSync.create({ restClient: {} as HederaRestClient });
+		const second = await HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] });
 		assert.notEqual(first, second);
 		await second.shutdown();
 	});
@@ -596,8 +424,8 @@ describe("HederaEventSync lifecycle", () => {
 	const controls = ["pauseRead", "resumeRead", "pauseProcessing", "resumeProcessing"] as const;
 
 	it("rejects query controls while shutdown is waiting for a runtime to stop", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(query(1));
+		const { sync, load } = await fixture();
+		await load(query(1));
 		const runtime = (sync as unknown as { queries: Map<number, { stop(): Promise<void> }> }).queries.get(1)!;
 		const originalStop = runtime.stop.bind(runtime);
 		let signalStop!: () => void;
@@ -615,7 +443,7 @@ describe("HederaEventSync lifecycle", () => {
 		try {
 			await stopStarted;
 			assert.ok(sync.getQuery(1));
-			await Promise.all(controls.map((control) => assert.rejects(sync[control](1), /has been shut down/, control)));
+			await Promise.all(controls.map((control) => assert.rejects(sync[control](1), /has been shut down|shutdown is in progress/, control)));
 		} finally {
 			releaseStop();
 			await shutdown;
@@ -623,20 +451,20 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("rejects query controls queued behind shutdown and after shutdown completes", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(query(1));
+		const { sync, load } = await fixture();
+		await load(query(1));
 		const shutdown = sync.shutdown();
 		try {
-			await Promise.all(controls.map((control) => assert.rejects(sync[control](1), /has been shut down/, control)));
+			await Promise.all(controls.map((control) => assert.rejects(sync[control](1), /has been shut down|shutdown is in progress/, control)));
 		} finally {
 			await shutdown;
 		}
 		assert.equal(sync.getQuery(1), undefined);
-		await Promise.all(controls.map((control) => assert.rejects(sync[control](1), /has been shut down/, control)));
+		await Promise.all(controls.map((control) => assert.rejects(sync[control](1), /has been shut down|shutdown is in progress/, control)));
 	});
 
 	it("still ignores missing query IDs in controls on an active instance", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		try {
 			await Promise.all(controls.map((control) => sync[control](999)));
 			assert.equal(sync.listQueries().length, 0);
@@ -646,8 +474,8 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("keeps the guarded singleton occupied until asynchronous shutdown settles", async () => {
-		const first = await HederaEventSync.create({ restClient: {} as HederaRestClient });
-		await first.addQuery(query(60));
+		const first = await HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] });
+		await first.start();
 		const runtime = [...(first as unknown as { queries: Map<number, { stop(): Promise<void> }> }).queries.values()][0];
 		const originalStop = runtime.stop.bind(runtime);
 		let signalStop!: () => void;
@@ -664,7 +492,7 @@ describe("HederaEventSync lifecycle", () => {
 		const shutdown = first.shutdown();
 		await stopStarted;
 		let replacementCreated = false;
-		const replacementPromise = HederaEventSync.create({ restClient: {} as HederaRestClient }).then((instance) => {
+		const replacementPromise = HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] }).then((instance) => {
 			replacementCreated = true;
 			return instance;
 		});
@@ -675,18 +503,18 @@ describe("HederaEventSync lifecycle", () => {
 		await shutdown;
 		const replacement = await replacementPromise;
 		assert.notEqual(replacement, first);
-		assert.equal(await HederaEventSync.create({ restClient: {} as HederaRestClient }), replacement);
+		assert.equal(await HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] }), replacement);
 		await replacement.shutdown();
 	});
 
 	it("rejects guarded create from a callback awaited by singleton shutdown", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient });
-		await sync.addQuery(query(69));
+		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] });
+		await sync.start();
 		let checked = false;
 		sync.setHooks({
 			async onQueryRemoved() {
 				await assert.rejects(
-					HederaEventSync.create({ restClient: {} as HederaRestClient }),
+					HederaEventSync.create({ restClient: {} as HederaRestClient, querySource: () => [query(60)] }),
 					LifecycleReentrancyError
 				);
 				checked = true;
@@ -699,36 +527,36 @@ describe("HederaEventSync lifecycle", () => {
 
 	it("rejects hook policies that JavaScript callers cannot express through the TypeScript union", async () => {
 		await assert.rejects(
-			HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false, hookFailurePolicy: "invalid" as never }),
+			HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false, querySource: () => [], hookFailurePolicy: "invalid" as never }),
 			/hookFailurePolicy must be one of/
 		);
 	});
 
 	it("requires a decodable non-anonymous event while accepting mixed ABIs", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const anonymousOnly = query(61);
 		anonymousOnly.abi = [{ type: "event", name: "Hidden", anonymous: true, inputs: [] }] as const;
-		await assert.rejects(sync.addQuery(anonymousOnly), /at least one non-anonymous event/);
+		await assert.rejects(load(anonymousOnly), /at least one non-anonymous event/);
 
 		const mixed = query(62);
 		mixed.abi = [
 			{ type: "event", name: "Hidden", anonymous: true, inputs: [] },
 			{ type: "event", name: "Ping", anonymous: false, inputs: [] },
 		] as const;
-		await sync.addQuery(mixed);
+		await load(mixed);
 		assert.ok(sync.getQuery(62));
 		await sync.shutdown();
 	});
 
 	it("rejects only topic-filtered overlaps that cannot move the seven-day window forward", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const stalled = query(63);
 		stalled.read.consistency = { overlapSeconds: 604_799.999_999_999 };
-		await assert.rejects(sync.addQuery(stalled), /usable seven-day topic-query window/);
+		await assert.rejects(load(stalled), /usable seven-day topic-query window/);
 
 		const advancing = query(64);
 		advancing.read.consistency = { overlapSeconds: 604_799.999_999_998 };
-		await sync.addQuery(advancing, false);
+
 
 		const unfilteredSingle = {
 			...query(65),
@@ -737,34 +565,33 @@ describe("HederaEventSync lifecycle", () => {
 			params: { timestamp: "1" },
 			read: { ...query().read, consistency: { overlapSeconds: 604_800 } },
 		};
-		await sync.addQuery(unfilteredSingle, false);
+
 
 		const transactions = transactionQuery(66);
 		transactions.read.consistency = { overlapSeconds: 604_800 };
-		await sync.addQuery(transactions, false);
+		await load(advancing, unfilteredSingle, transactions);
 		assert.equal(sync.listQueries().length, 3);
 		await sync.shutdown();
 	});
 
 	it("validates and canonicalizes transaction result filters at the runtime boundary", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
+		const { sync, load } = await fixture();
 		const uppercase = transactionQuery(67);
 		uppercase.params.result = "SUCCESS";
-		await sync.addQuery(uppercase);
+		await load(uppercase);
 		const stored = sync.getQuery(67);
 		assert.equal(stored?.type, "Transactions");
 		if (stored?.type === "Transactions") assert.equal(stored.params.result, "success");
 
 		const invalid = transactionQuery(68);
 		invalid.params.result = "successful" as never;
-		await assert.rejects(sync.addQuery(invalid), /result must be success, fail, or null/);
+		await assert.rejects(load(invalid), /result must be success, fail, or null/);
 		await sync.shutdown();
 	});
 
 	it("signals every query runtime before waiting for any one runtime to stop", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(query(58), false);
-		await sync.addQuery(query(59), false);
+		const { sync, load } = await fixture();
+		await load(query(58), query(59));
 		const runtimes = [...(sync as unknown as { queries: Map<number, { stop(): Promise<void> }> }).queries.values()];
 		assert.equal(runtimes.length, 2);
 
@@ -798,7 +625,7 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("pauses the affected read job when hookFailurePolicy is pause", async () => {
-		const sync = await HederaEventSync.create({
+		const { sync, load } = await fixture({
 			restClient: {} as HederaRestClient,
 			singletonGuard: false,
 			hookFailurePolicy: "pause",
@@ -812,7 +639,7 @@ describe("HederaEventSync lifecycle", () => {
 				reportedHook = failure.hook;
 			},
 		});
-		await sync.addQuery(query(21));
+		await load(query(21));
 
 		assert.equal(sync.getReadStatus(21)?.status.name, "PAUSED");
 		assert.equal(reportedHook, "onReadInit");
@@ -820,7 +647,7 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("stops a query runtime immediately when hookFailurePolicy is fail-fast", async () => {
-		const sync = await HederaEventSync.create({
+		const { sync, load } = await fixture({
 			restClient: {} as HederaRestClient,
 			singletonGuard: false,
 			hookFailurePolicy: "fail-fast",
@@ -830,7 +657,7 @@ describe("HederaEventSync lifecycle", () => {
 			onReadInit: async () => { throw new Error("fatal observer failure"); },
 			onHookError: () => void failures++,
 		});
-		await sync.addQuery(query(22));
+		await assert.rejects(load(query(22)), /initializ|failed/i);
 
 		assert.equal(failures, 1);
 		assert.equal(sync.getReadStatus(22)?.status.name, "FAILED");
@@ -840,8 +667,8 @@ describe("HederaEventSync lifecycle", () => {
 	});
 
 	it("summarizes read and processing states independently", async () => {
-		const sync = await HederaEventSync.create({ restClient: {} as HederaRestClient, singletonGuard: false });
-		await sync.addQuery(query(31));
+		const { sync, load } = await fixture();
+		await load(query(31));
 		await sync.pauseRead(31);
 		const summary = sync.getSummary();
 		assert.equal(summary.totalQueries, 1);

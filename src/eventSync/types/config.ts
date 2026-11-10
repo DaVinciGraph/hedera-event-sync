@@ -1,8 +1,9 @@
 import type { Abi } from "abitype";
-import type { NetworkName, ProviderName, TransactionResultFilter } from "@davincigraph/hedera-rest-client";
-import type { Cursor } from "./domain";
+import type { NetworkName, ProviderName, TransactionResultFilter, TransactionTypes } from "@davincigraph/hedera-rest-client";
+import type { Cursor, ReadonlyCallbackValue } from "./domain";
+import type { SyncContractLog } from "./mirror";
 
-export type { NetworkName, ProviderName, TransactionResultFilter } from "@davincigraph/hedera-rest-client";
+export type { NetworkName, ProviderName, TransactionResultFilter, TransactionTypes } from "@davincigraph/hedera-rest-client";
 
 /** Lifecycle states shared by read jobs and processing queues. */
 export type QueryQueueAndJobStatus = "PAUSED" | "RUNNING" | "PAUSING" | "RESUMING" | "FAILED" | "STOPPED";
@@ -10,6 +11,12 @@ export type QueryQueueAndJobStatus = "PAUSED" | "RUNNING" | "PAUSING" | "RESUMIN
 export type QueryKind = "Multi-Contract-Logs" | "Single-Contract-Logs" | "Transactions";
 /** Current lifecycle state and an optional operator-facing reason. */
 export type QueryStatus = { name: QueryQueueAndJobStatus; info?: string };
+
+/** Independent states applied only when a query ID first joins the catalog. */
+export type QueryStartState = {
+	read?: { name: "RUNNING" | "PAUSED"; info?: string };
+	process?: { name: "RUNNING" | "PAUSED"; info?: string };
+};
 
 /** One or more accepted values for a Mirror Node log-topic position. */
 export type ContractLogTopicFilter = string | readonly string[];
@@ -82,7 +89,7 @@ export type ContractMeta = {
 	version?: string | number;
 };
 
-/** Cursor, topic, and resolver inputs for a global contract-log query. */
+/** Cursor, topic, filter, and resolver inputs for a global contract-log query. */
 export type MultiContractLogsParams = {
 	/** At least one topic position must contain a filter. */
 	topics: ContractLogTopicsFilter;
@@ -90,6 +97,14 @@ export type MultiContractLogsParams = {
 	timestamp?: string | number;
 	/** Initial or restored tie-breaker for records sharing a timestamp. */
 	index?: number;
+	/**
+	 * Admission check receiving a frozen log snapshot before ABI decoding or
+	 * metadata resolution.
+	 * Return false to ignore a log, true to decode it strictly, or throw to retry
+	 * the page. Do not persist cursors or perform handler side effects here:
+	 * earlier accepted logs on the page have not yet been committed.
+	 */
+	logFilter?: (log: ReadonlyCallbackValue<SyncContractLog>, signal?: AbortSignal) => boolean | Promise<boolean>;
 	/** Resolves address-specific metadata before handler selection. */
 	contractResolver?: (address: string) => ContractMeta | undefined | Promise<ContractMeta | undefined>;
 };
@@ -106,6 +121,15 @@ export type SingleContractLogsParams = {
 export type TransactionsParams = {
 	/** Mirror Node account/contract identifier used by the transactions endpoint. */
 	accountId: string;
+	/**
+	 * Optional Mirror Node transaction category, such as "CRYPTOTRANSFER".
+	 * Omit to retain all categories allowed by the other endpoint filters.
+	 * This filters before download and is never inferred from handlers. Other
+	 * categories can carry balance movements and fees. Changing this selection
+	 * requires a new query ID with a deliberately chosen starting checkpoint.
+	 * Nonempty provider-specific names are passed through; surrounding whitespace is trimmed.
+	 */
+	transactionType?: TransactionTypes;
 	/** Numbers are safe-integer seconds; use a string to preserve fractional seconds exactly. */
 	timestamp?: string | number;
 	/** Tie-breaker used when restoring a processed checkpoint. */
@@ -126,7 +150,7 @@ export type RuntimeSingleContractLogsParams = Omit<SingleContractLogsParams, "ti
 	index: number;
 };
 
-/** Canonical cursor, endpoint, and result filter exposed for a transaction runtime. */
+/** Canonical cursor and endpoint filters exposed for a transaction runtime. */
 export type RuntimeTransactionsParams = Omit<TransactionsParams, "timestamp" | "index" | "result"> & {
 	timestamp: string;
 	index: number;
@@ -176,6 +200,7 @@ type QueryIdentity = {
 	id: number;
 	title: string;
 	icon?: string;
+	initialState?: QueryStartState;
 };
 
 /**

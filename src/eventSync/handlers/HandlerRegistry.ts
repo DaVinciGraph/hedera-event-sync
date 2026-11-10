@@ -9,9 +9,9 @@ type NotInferred<Value> = [Value][Value extends unknown ? 0 : never];
 
 /**
  * Erase a log handler only after the generic registration boundary has checked
- * its normalize/handle payload relationship. Keeping the original object is
- * intentional: resolution historically preserves identity (including class
- * prototypes), while the unsafe assertion remains confined to private storage.
+ * its normalize/handle payload relationship. Resolution preserves the original
+ * object's identity and class prototype, while the unsafe assertion remains
+ * confined to private storage.
  */
 function eraseLogHandler<Normalized, DecodedArguments>(handler: LogHandler<Normalized, DecodedArguments>): ErasedLogHandler {
 	return handler as unknown as ErasedLogHandler;

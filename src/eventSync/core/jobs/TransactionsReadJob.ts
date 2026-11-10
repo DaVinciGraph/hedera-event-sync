@@ -93,6 +93,7 @@ export class TransactionsReadJob extends ReadJob {
 			timestampLte,
 			pageSize: batchSize,
 			result: this.queryTyped.params.result,
+			transactionType: this.queryTyped.params.transactionType,
 			signal,
 		});
 	}

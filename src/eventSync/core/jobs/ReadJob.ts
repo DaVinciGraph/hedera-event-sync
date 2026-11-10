@@ -30,6 +30,7 @@ export abstract class ReadJob {
 	private resetFailuresOnResume = false;
 	private statusHookChain: Promise<void> = Promise.resolve();
 	private initialization?: Promise<void>;
+	private lifecycleHeld = false;
 
 	constructor(
 		protected readonly query: RuntimeQueryConfig,
@@ -85,13 +86,13 @@ export abstract class ReadJob {
 			await this.settleStatusTransitions();
 
 			// Auto-resume if paused due to backpressure and backlog dropped
-			if (this.pausedByBackpressure && this.getQueueSize() < this.backpressureThreshold * 0.8) {
+			if (!this.lifecycleHeld && this.pausedByBackpressure && this.getQueueSize() < this.backpressureThreshold * 0.8) {
 				this.requestResume(false);
 				this.pausedByBackpressure = false;
 				await this.settleStatusTransitions();
 			}
 
-			if (this.status.name !== "RUNNING") {
+			if (this.lifecycleHeld || this.status.name !== "RUNNING") {
 				await this.waitWithAbort(100, signal);
 				continue;
 			}
@@ -208,7 +209,36 @@ export abstract class ReadJob {
 	}
 
 	getStatus(): QueryStatus {
-		return { ...this.status };
+		return this.lifecycleHeld && this.status.name === "RUNNING"
+			? { name: this.cycleRunning ? "PAUSING" : "PAUSED", info: "Reading is paused for the synchronization instance" }
+			: { ...this.status };
+	}
+
+	/** Independent gate: never changes manual, failure, predicate, or backpressure ownership. */
+	setLifecycleHold(held: boolean): void {
+		if (this.lifecycleHeld === held) return;
+		this.lifecycleHeld = held;
+		this.cancelInFlightCycle();
+	}
+
+	async settleLifecycleHold(): Promise<void> {
+		while (this.cycleRunning) await sleep(10);
+		await this.settleStatusTransitions();
+		await this.flushHooks();
+	}
+
+	getControlState() {
+		return { status: { ...this.status }, consecutiveFailures: this.consecutiveFailures,
+			lastFailureSource: this.lastFailureSource, pausedByBackpressure: this.pausedByBackpressure };
+	}
+
+	restoreControlState(state: ReturnType<ReadJob["getControlState"]>): void {
+		this.status = { ...state.status };
+		this.query.read.status = this.status;
+		this.lastNotifiedStatus = this.status.name;
+		this.consecutiveFailures = state.consecutiveFailures;
+		this.lastFailureSource = state.lastFailureSource;
+		this.pausedByBackpressure = state.pausedByBackpressure;
 	}
 	getCursor(): Cursor {
 		return { ...this.cursor };
@@ -223,12 +253,12 @@ export abstract class ReadJob {
 		return this.lastCycle ? snapshotReadCycle(this.lastCycle) : undefined;
 	}
 
-	async pause(reason?: string): Promise<void> {
+	async pause(reason?: string, preserveExistingPause = false): Promise<void> {
 		this.assertControllable("pause");
 		// An operator pause supersedes backpressure ownership; only a future
 		// backpressure transition may opt this job into automatic resumption again.
 		this.pausedByBackpressure = false;
-		this.requestPause(reason ?? "admin");
+		if (!preserveExistingPause || (this.status.name !== "PAUSED" && this.status.name !== "PAUSING")) this.requestPause(reason ?? "admin");
 
 		await this.settleStatusTransitions();
 		await this.waitForStatus("PAUSED");

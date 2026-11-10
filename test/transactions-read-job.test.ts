@@ -7,6 +7,7 @@ import type { RuntimeQueryConfig } from "../src/eventSync/types/config";
 import type { SyncTransaction, SyncTransactionsPage } from "../src/eventSync/types/mirror";
 import type { StagedProcess } from "../src/eventSync/core/queue/types";
 import type { Process } from "../src/eventSync/types/domain";
+import type { RestClientTransactionsParams } from "../src/eventSync/rest/RestClient";
 
 function query(policy?: "error" | "skip"): Extract<RuntimeQueryConfig, { type: "Transactions" }> {
 	return {
@@ -62,6 +63,84 @@ class ExposedTransactionsReadJob extends TransactionsReadJob {
 }
 
 describe("transaction page ingestion", () => {
+	it("keeps mixed transaction types and their fee transfers when the type filter is omitted", async () => {
+		const registry = new HandlerRegistry();
+		const transactions = ["CRYPTOTRANSFER", "CONTRACTCALL", "TOKENMINT"].map((name, index) => {
+			registry.registerTransaction(name, { async handle() {} });
+			return { ...tx(name, `${10 + index}.000000001`), transfers: [{ account: "0.0.123", amount: -100 - index }] };
+		});
+		const requests: RestClientTransactionsParams[] = [];
+		let staged: readonly StagedProcess[] = [];
+		const job = new ExposedTransactionsReadJob(
+			query(),
+			{ fetchTransactions: async (params: RestClientTransactionsParams) => { requests.push(params); return page(transactions); } } as never,
+			registry,
+			async (items) => { staged = items; return items.map((item, index) => ({ ...item.process, id: index + 1 })) as Process[]; },
+			() => {},
+			() => 0,
+			100,
+			new HookBase()
+		);
+
+		const collected = await job.runCycle(new AbortController().signal);
+
+		assert.equal(requests[0].transactionType, undefined);
+		assert.deepEqual(collected, transactions);
+		assert.deepEqual(staged.map((item) => item.process.rawData), transactions);
+		assert.deepEqual(job.getCursor(), { timestamp: "100.000000000", index: 0 });
+	});
+
+	it("forwards an explicit type on every fresh fetch and overlap replay, including a failed request", async () => {
+		const config = query();
+		config.params.transactionType = "CONTRACTCALL";
+		config.params.result = null;
+		const registry = new HandlerRegistry();
+		registry.registerTransaction("CONTRACTCALL", { async handle() {} });
+		const requests: RestClientTransactionsParams[] = [];
+		const sourceKeys: string[] = [];
+		const failure = new Error("temporary mirror failure");
+		const job = new ExposedTransactionsReadJob(
+			config,
+			{ fetchTransactions: async (params: RestClientTransactionsParams) => {
+				requests.push(params);
+				if (requests.length === 1) throw failure;
+				const response = page([tx("CONTRACTCALL", "10.000000001")]);
+				response.syncWindowEnd = undefined;
+				return response;
+			} } as never,
+			registry,
+			async (items) => {
+				sourceKeys.push(...items.map((item) => item.process.sourceKey));
+				return items.map((item, index) => ({ ...item.process, id: index + 1 })) as Process[];
+			},
+			() => {},
+			() => 0,
+			100,
+			new HookBase()
+		);
+		const signals = Array.from({ length: 3 }, () => new AbortController().signal);
+
+		await assert.rejects(job.runCycle(signals[0]), (error) => error === failure);
+		assert.deepEqual(job.getCursor(), { timestamp: "1.000000000", index: 0 });
+		await job.runCycle(signals[1]);
+		await job.runCycle(signals[2]);
+
+		assert.equal(requests.length, 3);
+		assert.deepEqual(requests.map((params) => params.transactionType), ["CONTRACTCALL", "CONTRACTCALL", "CONTRACTCALL"]);
+		assert.deepEqual(requests.map((params) => params.signal), signals);
+		for (const request of requests) {
+			assert.equal(request.accountId, config.params.accountId);
+			assert.equal(request.provider, config.read.fetch.restProvider);
+			assert.equal(request.network, config.read.fetch.network);
+			assert.equal(request.pageSize, config.read.fetch.batchSize);
+			assert.equal(request.timestampGte, "1.000000000");
+			assert.ok(request.timestampLte);
+			assert.equal(request.result, null);
+		}
+		assert.deepEqual(sourceKeys, ["transaction:5:10.000000001", "transaction:5:10.000000001"]);
+		assert.deepEqual(job.getCursor(), { timestamp: "10.000000001", index: 0 });
+	});
+
 	it("fails the whole prepared page when any transaction has no handler", async () => {
 		const registry = new HandlerRegistry();
 		registry.registerTransaction("HANDLED", { async handle() {} });
@@ -87,11 +166,14 @@ describe("transaction page ingestion", () => {
 	it("skips missing handlers only when the query explicitly requests it", async () => {
 		const registry = new HandlerRegistry();
 		registry.registerTransaction("HANDLED", { async handle() {} });
-		const transactions = [tx("HANDLED", "10.000000001", 2), tx("UNHANDLED", "11.000000001")];
+		const transactions = [tx("HANDLED", "10.000000001", 2), tx("UNHANDLED", "11.000000001"), tx("TOKENMINT", "12.000000001")];
+		const config = query("skip");
+		config.process.skipTransactionTypes = ["TOKENMINT"];
+		const requests: RestClientTransactionsParams[] = [];
 		let staged: readonly StagedProcess[] = [];
 		const job = new ExposedTransactionsReadJob(
-			query("skip"),
-			{ fetchTransactions: async () => page(transactions) } as never,
+			config,
+			{ fetchTransactions: async (params: RestClientTransactionsParams) => { requests.push(params); return page(transactions); } } as never,
 			registry,
 			async (items) => {
 				staged = items;
@@ -104,6 +186,7 @@ describe("transaction page ingestion", () => {
 		);
 
 		await job.runCycle(new AbortController().signal);
+		assert.equal(requests[0].transactionType, undefined, "handlers and processing skips must not infer a request filter");
 		assert.equal(staged.length, 1);
 		assert.equal(staged[0].process.eventName, "HANDLED");
 		assert.equal(staged[0].process.pointerIDX, 2);

@@ -77,9 +77,9 @@ const restClient = new HederaRestClient({
   defaultProvider: "public",
   defaultNetwork: "testnet",
 });
-const sync = await HederaEventSync.create({ restClient });
+const sync = await HederaEventSync.create({ restClient, querySource: () => queries });
 
-// Hooks observe the engine. Install them before starting a query.
+// create() does not load queries or start work. Register hooks and handlers first.
 sync.setHooks({
   onReadCycleCompleted(query, result) {
     console.log("Read cycle", query.id, {
@@ -121,7 +121,7 @@ process.once("SIGTERM", shutdown);
 // The standard selector for Transfer(address,address,uint256).
 const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-await sync.addQuery({
+const queries = [{
   type: "Single-Contract-Logs",
   id: 1,
   title: "Token transfers",
@@ -146,8 +146,9 @@ await sync.addQuery({
     pauseAfterConsecutiveFailures: 5,
   },
   process: { pauseAfterConsecutiveFailures: 5 },
-});
+}];
 
+await sync.start();
 console.log("Watching transfers. Press Ctrl+C to stop.");
 ```
 
@@ -159,9 +160,11 @@ node sync.mjs 0.0.123
 
 You will see read-cycle messages even when no matching transfers are available. This query starts **from now**, not from the beginning of history. The default reader stays 15 seconds behind the local clock and polls about every 30 seconds, with startup delay and jitter, so immediate event output is not expected.
 
-There is no additional start command: `addQuery()` starts synchronization. Register handlers and install hooks before calling it. `create()` intentionally reuses one process-local singleton by default; later calls do not replace its configuration.
+Version 2 uses one required `querySource` callback and explicit `start()`. The callback above returns a static array; it can also load a complete catalog from a database or file. `create()` intentionally reuses one process-local singleton by default; later calls do not replace its configuration. See the [v2 migration guide](docs/migration-v2.md) when upgrading from 1.x.
 
 Next, replace the printing handler with your application logic. For typed handlers, other event ABIs, topic filters, and transaction queries, follow [Queries and handlers](docs/queries.md).
+
+Transaction queries optionally accept `params.transactionType`, for example `"CRYPTOTRANSFER"` for an intentionally transfer-category-only source. Omit it to retain every transaction type allowed by the account, timestamp, and result filters (`result` still defaults to `"success"`). Handler registration does not infer a type filter. Balance accounting may need other categories and fees; see the [transaction recipe](docs/queries.md#transactions) before narrowing the source. Changing this filter requires a new query ID and a deliberate starting checkpoint.
 
 ## Connect it to your application
 
@@ -182,7 +185,7 @@ Return or await your database operation from `handle()`. If it throws, the attem
 
 Make writes idempotent. For example, a transfer table can have a unique key using the network, consensus timestamp, and log index. Reprocessing the same record then does not insert another transfer. Your application can use its existing database driver or ORM; Event Sync does not choose one.
 
-The [integration guide](docs/integrations.md) includes an actual PostgreSQL schema and handler, not just an unspecified `saveToDatabase()` placeholder.
+The [integration guide](docs/integrations.md) includes a PostgreSQL schema, an idempotent handler, and checkpoint persistence.
 
 ### Hooks connect progress to other services
 
@@ -216,6 +219,8 @@ You can install several hook objects together with `sync.setHooks([historyHooks,
 
 By default, rejected hooks are reported through `onHookError` and synchronization continues. This is useful when an optional history database or notification service is unavailable. Hooks are still awaited, so give external requests appropriate timeouts: `"continue"` handles a rejection, not a promise that never settles.
 
+For observers that must stop further work on failure, configure the `"pause"` or `"fail-fast"` hook error policy. These policies affect the query, not the host process; see the [hook reference](docs/reference.md#hook-reference) for their scope and recovery behavior.
+
 A success hook failing does **not** rerun a handler that already succeeded. If an email, webhook, or downstream task is a required business effect, perform it through the handler or write a durable outbox entry with your database changes. Observer hooks alone do not provide guaranteed external delivery.
 
 ### Make progress visible
@@ -223,6 +228,21 @@ A success hook failing does **not** rerun a handler that already succeeded. If a
 Use `onProcessStarted` to show an active attempt, `onStepCreated` to append steps as they occur, and success/failure hooks to finish that attempt in your UI. `onQueryStatusChange` distinguishes reading from processing.
 
 `context.addStep()` records a diagnostic immediately; it does not execute the named task or print anything by itself. Await the actual work in your handler and add steps where they describe that work. A fast handler may finish between UI polls; hooks expose its transitions without artificial delays.
+
+For an operational query list, filter the loaded catalog by reader/processor status and search its configured titles or identifiers:
+
+```js
+const page = sync.listQueries(1, 25, {
+  network: "testnet",
+  readStatus: ["PAUSED", "PAUSING"],
+  processStatus: "RUNNING",
+  search: "transfers",
+  order: "id-asc",
+});
+console.log(page.items, page.total);
+```
+
+Status filters include effective global holds; search needs no Mirror Node lookup. All filters apply before pagination and leave synchronization unchanged. See [query-list filtering](docs/reference.md#query-list-filtering) for exact matching rules and the distinction between failure-triggered pauses and terminal failures.
 
 See the [integration guide](docs/integrations.md) for the UI event mapping and [hook reference](docs/reference.md#hook-reference) for every available callback.
 
@@ -234,11 +254,31 @@ Choose an initial `params.timestamp` and `params.index` for each query:
 - **Historical:** start at an earlier cursor. Omitted fields default to timestamp zero and index zero, which starts a backfill.
 - **Restart:** restore both fields from your saved processed checkpoint.
 
-The engine's queue, history, and checkpoints live in memory. To resume after a restart, your application loads a saved checkpoint, registers its handlers and hooks, and adds the query again with that cursor.
+The engine's queue, history, and checkpoints live in memory. To resume after a restart, your application returns configurations restored from saved checkpoints in `querySource`, registers its handlers and hooks, and calls `start()`.
 
 Persist `onProcessedCheckpoint` or `getProcessedCheckpoint(id)`—**not the read cursor**. Reading can be ahead of handlers. A processed checkpoint also deliberately retains an overlap horizon for late-indexed records, so it may stay unchanged across several successful events.
 
 The [checkpoint recipe](docs/integrations.md) shows saving and loading both fields in PostgreSQL. A checkpoint belongs to the same logical query and network; it is not interchangeable between mainnet and testnet. Restart replay is expected, which is why handlers need idempotent side effects.
+
+## Pause, restart, and reload the whole instance
+
+```js
+await sync.pauseAll({ scope: "read" });    // Stop ingestion; queued handlers can drain.
+await sync.resumeAll({ scope: "read" });   // Release only the global read hold.
+await sync.pauseAll({ scope: "process" }); // Let the active handler settle; hold new handlers.
+await sync.resumeAll();         // Release both global holds (the default scope).
+await sync.pauseAll();          // Hold both sides and settle active work.
+await sync.resumeAll();
+await sync.restartQueries();    // Rebuild the accepted catalog from safe checkpoints.
+await sync.reloadQueries();     // Call querySource again, validate, then rebuild.
+console.log(sync.getLifecycleState());
+```
+
+`scope` accepts `"read"`, `"process"`, or `"both"` and defaults to `"both"`; `timeoutMs` is optional. Processing-only pause leaves readers running until queue capacity applies backpressure. Each global hold is independent: after `pauseAll()`, `resumeAll({ scope: "read" })` releases reading while processing stays held. Independent manual/failure pauses survive every global resume and replacement.
+
+Successful restart/reload preserves both global hold choices, including for newly loaded queries. Inspect `globalReadPaused` and `globalProcessPaused` separately; `globalPaused` is true only when **both** sides are held. `maintenanceHeld` identifies a hold used for lifecycle coordination or recovery. Reload obtains the complete desired catalog: omitted IDs are removed, new IDs are added, and returning `[]` deliberately removes all queries. A failed loader or invalid catalog leaves existing queries usable. IDs represent stable logical sources; use a new ID when changing the network or source selection.
+
+For durable consumers, supply `beforeReplace` to save final processed checkpoints before the old queues are discarded. Its failure keeps old work held for recovery; it is a required persistence boundary independent of observer hook policy. The package cannot transact with your database or forcibly terminate a hung handler. A lifecycle timeout reports the blocked operation and prevents another generation from overlapping it. See [lifecycle coordination](docs/lifecycle.md) for loader examples, persistence, and recovery rules.
 
 ## Where to go next
 
@@ -248,9 +288,12 @@ The [checkpoint recipe](docs/integrations.md) shows saving and loading both fiel
 | Use a private mirror, credentials, or another network | [Provider configuration](docs/queries.md#providers-and-networks) |
 | Persist business data and checkpoints, send email, or drive a dashboard | [Application integrations](docs/integrations.md) |
 | Tune polling, capacity, retention, and failure behavior | [Configuration reference](docs/reference.md#configuration-reference) |
+| Upgrade from 1.x | [v2 migration guide](docs/migration-v2.md) |
+| Coordinate an instance or load from a file/database | [Lifecycle coordination](docs/lifecycle.md) |
 | Pause, resume, inspect, replace, or shut down queries | [Runtime management](docs/reference.md#runtime-management) |
 | Understand replay, hook ordering, and lifecycle restrictions | [Guarantees and lifecycle reference](docs/reference.md) |
 | Investigate missing output or paused processing | [Troubleshooting](docs/reference.md#troubleshooting) |
+| Review version changes or validate a release archive | [Changelog](CHANGELOG.md) · [Release checklist](docs/releasing.md) |
 
 No settings need to be changed merely to enable third-party integrations. The handlers and hooks are the integration points; your application supplies the services behind them.
 

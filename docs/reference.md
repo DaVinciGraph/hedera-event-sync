@@ -1,11 +1,12 @@
 # API reference and guarantees
 
-[Back to the README](../README.md) · [Queries and handlers](queries.md) · [Application integrations](integrations.md)
+[Back to the README](../README.md) · [Queries and handlers](queries.md) · [Application integrations](integrations.md) · [Changelog](../CHANGELOG.md) · [Release checklist](releasing.md)
 
 Use this page to look up options and exact behavior after choosing your application's queries, handlers, and observers. Code snippets using `sync` assume an existing synchronizer and run outside its active callbacks.
 
 - [Configuration](#configuration-reference)
 - [Runtime management and recovery](#runtime-management)
+- [Safe query editing](#safe-query-editing)
 - [Handler types and registration](#handler-types-and-registration)
 - [Processes, attempts, and steps](#processes-attempts-and-steps)
 - [Hooks](#hook-reference)
@@ -28,6 +29,8 @@ Pass these to `HederaEventSync.create(options)`:
 | Path | Required/default | Purpose |
 | --- | --- | --- |
 | `restClient` | Required | Configured `HederaRestClient` used by queries |
+| `querySource` | Required | Sync/async complete catalog loader; called only by `start()` and `reloadQueries()` with `{ signal, reason }` |
+| `beforeReplace` | Optional | Awaited persistence boundary with final processed checkpoints before restart/reload/shutdown releases old work; required for durable replacement guarantees |
 | `singletonGuard` | `true` | Reuse the process-local instance; `false` deliberately creates an isolated engine |
 | `hookFailurePolicy` | `"continue"` | `"continue"`, `"pause"`, or `"fail-fast"` |
 | `defaults` | Optional | Fallback values listed below |
@@ -52,6 +55,7 @@ Set defaults **inside** `defaults`. Query-level values take precedence.
 | `id` | Required | Unique non-negative safe integer in this engine |
 | `title` | Required | Non-empty display title |
 | `icon` | Optional | Application display metadata |
+| `initialState` | Optional | Initial read/process `RUNNING` or `PAUSED` states for newly introduced IDs; existing runtime pause ownership survives reload |
 | `read.fetch.restProvider` | Required | Provider name configured in the REST client |
 | `read.fetch.network` | Required | Network name configured in the REST client |
 | `read.pauseAfterConsecutiveFailures` | Required | Positive integer; pauses the reader at this failure count |
@@ -76,11 +80,15 @@ The query must still supply a `params` object even when all its fields are optio
 | `contract.id`, `contract.type`, `contract.version` | All queries | Optional application metadata; type/version select specialized log handlers |
 | `params.topics` | Log queries | Required and non-empty for multi-contract queries; optional for single-contract queries |
 | `params.contractResolver` | Multi-contract logs | Optional `(address) => metadata`, synchronous or asynchronous |
+| `params.logFilter` | Multi-contract logs | Optional `(log, signal?) => boolean`, synchronous or asynchronous; frozen snapshot checked before decoding, false skips and errors retry the page |
 | `process.skipEventNames` | Log queries | `[]`; exact names excluded after successful decoding |
 | `params.accountId` | Transactions | Required account/contract endpoint identifier |
+| `params.transactionType` | Transactions | Optional single `TransactionTypes` name; omitted/`undefined` means no Mirror Node transaction-type filter; `null` is invalid |
 | `params.result` | Transactions | `"success"` (default), `"fail"`, or `null` to remove the result filter |
 | `process.skipTransactionTypes` | Transactions | `[]`; exact type names to exclude |
 | `process.unhandledTransactionPolicy` | Transactions | `"error"`; `"skip"` deliberately discards types without handlers |
+
+`params.transactionType` selects the source transaction category and combines with account, timestamp, and result filters. It must be a single nonempty string; normalization trims surrounding whitespace and preserves case. Known names have editor completion, while future/provider names remain accepted strings; the Mirror Node determines which names it supports. Handler registration never infers this filter; local skip rules and missing-handler errors still apply to returned records. A category such as `CRYPTOTRANSFER` is not a complete account balance history: fees and other balance movements can appear in other categories. See the [transaction recipe](queries.md#transactions) before narrowing a query.
 
 ### Timing, capacity, and retention
 
@@ -119,7 +127,7 @@ Use this recipe on an active or normally paused query. A terminal `FAILED` or `S
 | --- | --- |
 | `getQuery(id)` | Resolved query snapshot, or `undefined` |
 | `listQueries()` | All resolved query snapshots |
-| `listQueries(page, pageSize, options?)` | Query page; options: `type`, `network`, `order` (`"insertion"`, `"id-asc"`, `"id-desc"`) |
+| `listQueries(page, pageSize, options?)` | Query page; options: `type`, `network`, `contractType`, `readStatus`, `processStatus`, `search`, `order` (`"insertion"`, `"id-asc"`, `"id-desc"`); see [query-list filtering](#query-list-filtering) |
 | `getReadStatus(id)` | `{ status: { name, info? }, cursor: { timestamp, index } }`, or `undefined` |
 | `getQueueStatus(id)` | `{ status: { name, info? } }`, or `undefined` |
 | `getLastReadCycle(id)` | Most recent terminal `ReadCycleAudit`, or `undefined` |
@@ -130,22 +138,118 @@ Use this recipe on an active or normally paused query. A terminal `FAILED` or `S
 | `getProcessingTimeline(id, size)` | Source-ordered `Process[]`; up to `size` processed records, active/failed center, and up to `size` queued records |
 | `getStatistics(id)` | `{ total, queued, processing, processed, failed }`, or `undefined` |
 | `getSummary()` | Instance query/process counts and separate read/processing lifecycle totals |
-| `pauseRead(id)` / `resumeRead(id)` | Pause/resume ingestion |
-| `pauseProcessing(id)` / `resumeProcessing(id)` | Pause/resume handler execution |
-| `addQuery(config, skipOnDuplication?)` | Add and start a full query configuration |
-| `updateQuery(config, skipOnDuplication?)` | Stop and replace the runtime with the same ID |
-| `removeQuery(id)` | Stop and remove a query |
-| `shutdown()` | Stop all queries and release runtime state |
+| `pauseRead(id, options?)` / `resumeRead(id)` | Pause/resume ingestion; pause accepts `{ preserveExistingPause?: boolean }` |
+| `pauseProcessing(id, options?)` / `resumeProcessing(id)` | Pause/resume handler execution; pause accepts `{ preserveExistingPause?: boolean }` |
+| `validateQuery(config, initialState?)` | Normalize and validate a detached configuration without registering it |
+| `setHooks(hookOrArray)` | Synchronously replace the observer list for subsequent events; `[]` removes observers |
+| `registry` | Shared `HandlerRegistry` used by this engine; see [registration methods](#registry-methods) |
+| `start(options?)` | Load and validate the initial catalog, then start work |
+| `pauseAll(options?)` / `resumeAll(options?)` | Install/release selected global holds with `{ scope?: "read" \| "process" \| "both", timeoutMs?: number }`; default scope is `"both"`, independent of per-query pauses |
+| `restartQueries(options?)` | Replace runtimes from the accepted catalog and final processed checkpoints |
+| `reloadQueries(options?)` | Load a complete candidate catalog, validate it, then replace runtimes |
+| `getLifecycleState()` | Snapshot of `started`, `closed`, `generation`, `globalReadPaused`, `globalProcessPaused`, `globalPaused`, `maintenanceHeld`, `recoveryRequired`, optional current operation and last error |
+| `shutdown(options?)` | Settle work, confirm final checkpoint persistence, and release runtime state |
 
 Pages contain `{ items, page, pageSize, total, totalPages, hasPrev, hasNext }`. Page numbers start at one and are clamped; an empty result reports one empty page. Statistics describe **currently retained records**, not durable lifetime totals. Retention, replacement, removal, and restart affect the counts.
+
+`page` and `pageSize` must be positive safe integers. `listProcesses()` orders by source timestamp/index, not process creation time; it returns an empty page for a missing query. `getProcessingTimeline()` accepts a non-negative safe integer and returns `[]` for a missing query. Process lists and timelines include payloads; only the active/failed-process getters omit them by default.
+
+`getSummary()` returns `{ totalQueries, runningQueries, pausedQueries, totalProcesses, queued, processing, processed, failed, read, process }`. A query counts as running only when both sides are `RUNNING`; it counts as paused when either side is `PAUSED` or `PAUSING`. These two counts need not sum to `totalQueries`. Each of `read` and `process` contains `{ running, paused, failed, stopped, transitioning }`, with `PAUSING` and `RESUMING` counted as transitioning.
+
+On the per-query pause methods, `preserveExistingPause: true` retains an existing independent pause reason instead of replacing it with an administrative pause reason. It does not preserve automatic backpressure ownership: explicitly pausing a reader still requires an explicit resume. Global holds are separate from these per-query pause settings. `setHooks()` rejects with `LifecycleBusyError` while an instance-wide lifecycle operation is active.
 
 Returned queries, processes, cursors, audits, and summaries copy arrays, plain objects, and `Date` values. Functions, `Map`, `Set`, `Error`, and custom class instances remain shared references, so treat every inspection result as read-only. Mutating copied plain data does not reconfigure the running engine.
 
 The default return type of `getInFlightProcess()` and `getFailedProcess()` is `ProcessWithoutPayload`; it does not contain `data` or `rawData`. Passing the literal `{ includePayload: true }` returns `Process`, while a runtime boolean correctly produces the union of both possible shapes. Successful read-cycle items expose recursively read-only `SyncReadItem` values, while unhandled-item hooks expose a recursively read-only `SyncTransaction` instead of `unknown`.
 
-`addQuery()` and `updateQuery()` accept an optional `skipOnDuplication` argument, which defaults to `true`. Duplicate detection compares normalized runtime configuration while ignoring `id`, `title`, `icon`, and live statuses; callback values compare by identity. Set it to `false` only when equivalent readers are deliberate. For `updateQuery()`, a duplicate of another query leaves the target unchanged when skipping is enabled.
+The required loader is the only configuration interface. Distinct IDs remain distinct even when their configurations are equivalent; duplicate IDs reject the complete candidate catalog. See [lifecycle coordination](lifecycle.md) and the [v2 migration guide](migration-v2.md).
 
 `getProcessingTimeline(id, size)` can therefore return more than `size` records; `size: 0` returns an empty array. Runtime inspection is not a substitute for a durable audit log.
+
+### Query-list filtering
+
+The paginated overload accepts `ListQueriesOptions`. All filters apply to the currently loaded runtime catalog; they do not load saved queries from your database or call `querySource`. Omitted or explicitly `undefined` options leave that field unfiltered. The no-argument `listQueries()` overload still returns every loaded query.
+
+#### Contract type
+
+`contractType?: string | null | undefined` selects configured contract metadata:
+
+| `contractType` value | Queries included |
+| --- | --- |
+| Omitted or `undefined` | All contract types; existing behavior is unchanged |
+| A string | An exact, case-sensitive match against the query's `contract.type`; strings are not trimmed or normalized |
+| `null` | Queries with no `contract`, or an absent, `null`, empty, or whitespace-only `contract.type` |
+
+`contractType` matches the query's configured metadata, not per-log metadata from `contractResolver`. For example, `type: "Single-Contract-Logs"` selects the query kind, while `contractType: "TOKEN"` selects an application-defined contract label.
+
+#### Reader and processor status
+
+`readStatus` and `processStatus` each accept one `QueryStatus["name"]` or a readonly array of those names:
+
+| Value | Queries included |
+| --- | --- |
+| Omitted or `undefined` | All statuses for that side |
+| A status name | An exact match against that side's effective status |
+| An array of status names | Any listed status for that side; `[]` matches no queries |
+
+Names are case-sensitive: `"RUNNING"`, `"PAUSING"`, `"PAUSED"`, `"RESUMING"`, `"FAILED"`, or `"STOPPED"`. Invalid names, non-string entries, and non-array objects are rejected, including when the catalog is empty.
+
+The filters use the same effective statuses returned in query snapshots and by `getReadStatus()` / `getQueueStatus()`. A global read hold changes an otherwise running reader to `PAUSING` while it settles, then `PAUSED`; it does not change the processing filter. A global processing hold works independently. Maintenance holds apply to both sides. See [read and processing holds](lifecycle.md#read-and-processing-holds).
+
+Reaching the consecutive-failure limit pauses the affected side as `PAUSED`; it is not a terminal `FAILED` status. A `FAILED` filter alone therefore does not find every query that needs attention. Inspect the returned status's `info` and the relevant read/process history to understand a pause.
+
+#### Search
+
+`search?: string | undefined` is a literal, case-insensitive substring match against any of:
+
+- The configured query title.
+- The query ID converted to a string.
+- Configured `contract.address` and `contract.id` metadata, when present.
+- `params.accountId` for transaction queries.
+
+Leading and trailing whitespace in the search term is trimmed; an empty or whitespace-only term leaves search unfiltered. A non-string value is rejected. Search is one literal term, with no regular expressions, wildcards, or token splitting. For example, `"12"` can match query IDs `12` and `120`, while `"0.0.98"` can match a configured account ID.
+
+Search does not resolve identifiers through a Mirror Node or inspect encountered logs, payloads, or `contractResolver` results. An ID and its EVM address are both searchable only if both are present in the supported configured fields.
+
+#### Combining filters and pagination
+
+Separate filter fields combine with AND, including `type`, `network`, `contractType`, `readStatus`, `processStatus`, and `search`. Status alternatives within one array use OR; search matches any of its supported fields.
+
+```ts
+// Existing calls keep their behavior.
+const allQueries = sync.listQueries();
+const allTypes = sync.listQueries(1, 20, { contractType: undefined });
+
+const tokens = sync.listQueries(1, 20, {
+  network: "mainnet",
+  type: "Single-Contract-Logs",
+  contractType: "TOKEN",
+  order: "id-asc",
+});
+
+// Find Station readers that are paused or settling while processing stays enabled.
+const pausedReaders = sync.listQueries(1, 25, {
+  network: "testnet",
+  readStatus: ["PAUSED", "PAUSING"],
+  processStatus: "RUNNING",
+  search: "station",
+  order: "id-asc",
+});
+
+// Match configured contract/account identifiers without a Mirror Node lookup.
+const accountQueries = sync.listQueries(1, 25, { search: "0.0.98" });
+
+// A page beyond the filtered result is clamped to its last available page.
+const unspecified = sync.listQueries(999, 20, {
+  contractType: null,
+  order: "id-desc",
+});
+console.log(unspecified.page, unspecified.total, unspecified.totalPages);
+```
+
+Filtering happens before pagination. `total`, `totalPages`, `hasPrev`, and `hasNext` describe the filtered result, and an out-of-range page is reclamped to that result's last page. No matches produce page 1 with an empty `items` array and `totalPages: 1`. These rules apply to all three order modes: `"insertion"` (the default), `"id-asc"`, and `"id-desc"`.
+
+These are inspection-only filters: they do not change ingestion, checkpoints, ABI decoding, handler selection, or processing. Applications can expose the options through their own API and UI; the package performs the matching and pagination. To admit or reject source logs before decoding, use the separate [`params.logFilter` option](queries.md#multiple-contracts-by-topic).
 
 ### Error channels and recovery
 
@@ -158,9 +262,9 @@ The default return type of `getInFlightProcess()` and `getFailedProcess()` is `P
 
 Callback error arguments are `unknown`: JavaScript can throw values other than `Error`. Stored `ProcessTry.error` and read-cycle `error` fields are JSON strings containing error details, not `Error` objects.
 
-After correcting an ordinary threshold failure, resume the affected paused side. Explicit processing resume resets the consecutive-failure budget while retaining attempt history. A terminal `FAILED` or `STOPPED` side requires runtime replacement rather than resume.
+After correcting an ordinary threshold failure, resume the affected paused side. Explicit processing resume resets the consecutive-failure budget while retaining attempt history. A terminal `FAILED` or `STOPPED` side requires runtime replacement rather than resume. Replacement carries it forward as an independent pause with its reason; explicitly resume the affected side after correcting the cause.
 
-`updateQuery()` takes a **full configuration**, not a patch. It stops the old runtime, discards its in-memory queue/history/deduplication state, and starts from the supplied `params.timestamp` and `params.index`. It does not automatically preserve the previous checkpoint. When continuity is intended, capture `getProcessedCheckpoint(id)` before replacement and explicitly include both fields in the replacement configuration. Expect safe replay and use idempotent handlers.
+Use `restartQueries()` for runtime recovery with the accepted configuration, or `reloadQueries()` after changing the loader source. Both preserve final processed checkpoints for unchanged logical IDs rather than the reader's potentially advanced cursor. Expect replay and use idempotent handlers. Source identity changes require a fresh ID; the package will not silently carry a checkpoint to a different source. For transactions, adding, removing, or changing `params.transactionType` changes source identity, as does changing `params.result`. Choose the new ID's initial checkpoint deliberately so a broader filter can include previously excluded history.
 
 ## Handler types and registration
 
@@ -169,6 +273,21 @@ For complete typed event and transaction examples, see [Queries and handlers](qu
 `LogHandler<Normalized, DecodedArguments>` types both stages of a log handler. The decoded-argument parameter defaults to `unknown`; registration infers both parameters and checks the normalizer/handler pairing, but cannot prove that string registration keys match an ABI.
 
 `TransactionHandler<"CRYPTOTRANSFER">` receives a recursively read-only `SyncTransaction` with its existing `name` narrowed. It has no normalization method and does not add transaction-specific fields.
+
+### Registry methods
+
+Use `sync.registry`, or construct `new HandlerRegistry()` for standalone processing:
+
+| Method | Behavior |
+| --- | --- |
+| `registerLog(key, handler)` | Register or replace a log handler under an exact `HandlerKey` |
+| `unregisterLog(key)` | Remove that registration; a missing key is a no-op |
+| `resolveLog(eventName, contractType?, version?)` | Return the most specific registered log handler, or `undefined` |
+| `registerTransaction(type, handler)` | Register or replace a transaction handler under its exact name |
+| `unregisterTransaction(type)` | Remove that registration; a missing name is a no-op |
+| `resolveTransaction(type)` | Return the exact transaction handler, or `undefined` |
+
+These methods are synchronous. `registerLogs(registry, entries)` and `registerTxs(registry, entries)` register `[key, handler]` pairs in order; later duplicate keys replace earlier ones. The registry retains each handler object, including its class instance identity. Registration is a TypeScript boundary, not runtime ABI validation.
 
 ### Handler context
 
@@ -187,7 +306,9 @@ Preparation callbacks never receive `addStep`. Managed execution supplies it to 
 
 `context.raw`, transaction-handler data, resolved metadata, and standalone resolver inputs are recursively read-only in their public TypeScript contract. This is not runtime freezing: mutation through an unsafe cast remains visible to later application code receiving the same record. Internal source identity is captured independently.
 
-Overlap replay can invoke normalizers and resolvers again, and repeat `onUnhandledItem` for deliberately skipped transactions. Deduplication suppresses duplicate queue insertion and handler execution, not repeated preparation. Keep preparation pure/replay-safe and that observer idempotent.
+`params.logFilter` and standalone `LogPrepareOptions.logFilter` receive a separate frozen source snapshot with a frozen topics array. Their inputs cannot mutate the raw record used for subsequent decoding and callbacks. Returning false performs no handler work or durable checkpoint update. Filters must not persist cursors or application state: earlier accepted logs on that page are not committed yet.
+
+Overlap replay can invoke filters, normalizers and resolvers again, and repeat `onUnhandledItem` for deliberately skipped transactions. Deduplication suppresses duplicate queue insertion and handler execution, not repeated preparation. Keep preparation pure/replay-safe and that observer idempotent. Reattach callback functions when restoring JSON-persisted query settings; engine snapshots retain functions, but JSON does not.
 
 ### Selecting specialized log handlers
 
@@ -253,6 +374,8 @@ A **process** represents one source record. Each execution adds an **attempt** t
 
 All hooks are optional. Query, process, attempt, and step arguments are read-only snapshots; see [snapshot and ordering guarantees](#hook-guarantees-and-failure-policy).
 
+Install one `SyncHooks` object or an array with `sync.setHooks(...)`. Hooks may return `void` or `Promise<void>`. Observers run serially in array order for each event, but separate events and queries can overlap. A rejected observer is reported and does not prevent the remaining observers from receiving that event. Errors in `onHookError` are contained without recursive reporting.
+
 | Hook | Arguments and purpose |
 | --- | --- |
 | `onQueryAdded(query)` | Registered, before reader initialization |
@@ -278,7 +401,7 @@ All hooks are optional. Query, process, attempt, and step arguments are read-onl
 
 For each query, the package runs two independent loops:
 
-1. The read loop fetches and validates Mirror Node pages, performs source-specific preparation, and atomically commits a prepared page to the in-memory queue. For logs, preparation follows this order: strict ABI decoding, explicit exclusion, contract resolution, handler selection, and normalization.
+1. The read loop fetches and validates Mirror Node pages, performs source-specific preparation, and atomically commits a prepared page to the in-memory queue. For logs, preparation follows this order: optional log-filter admission, strict ABI decoding, explicit exclusion, contract resolution, handler selection, and normalization.
 2. The processing loop handles records in committed queue order. Records within each fetched page are source-ordered, while a record indexed late during overlap replay can be appended after a newer record. A failed item is retried at the head of the queue until its configured consecutive-failure threshold is reached.
 
 Each item's `onProcessEnqueued` notification settles before that item becomes eligible for processing.
@@ -336,6 +459,8 @@ Hook failures are contained and reported to `onHookError`. `hookFailurePolicy` d
 
 The selected `"pause"` or `"fail-fast"` runtime action is initiated before `onHookError` observers are awaited. A slow or non-settling error reporter therefore cannot delay the configured safety policy, although the hook dispatch itself remains pending until that reporter settles.
 
+Direct consumers can construct `new CompositeHooks(observers, { policy?, onFailure? })` and replace its observer array with `setHooks(observers)`. The separate `onFailure` control callback is invoked immediately and may return `void` or `Promise<void>`. Its promise is not awaited; synchronous throws and asynchronous rejections are contained, and reporting of the original hook failure continues. A standalone dispatcher only reports the selected policy; it cannot pause an engine without a corresponding control callback. The synchronizer supplies a synchronous implementation that applies the selected runtime policy.
+
 Query, process, attempt, step, and JSON-like result objects are recursively copied before each hook invocation. Arrays, plain objects, and `Date` values are copied; functions, `Map`, `Set`, `Error`, and custom class instances are passed by reference. Snapshotting copies property descriptors without invoking accessors; a proxy that cannot be inspected safely is treated as an opaque shared value. Hook data is exposed through recursively read-only TypeScript views, but it is not frozen at runtime; opaque values typed as `unknown` remain the consumer's responsibility.
 
 `onReadPage.itemCount` is the fetched page length. On successful cycles, `onReadCycleCompleted.items` contains eligible records from fully handled pages, including explicit exclusions and overlap replays, and `itemCount` equals its length. Failed cycles report an empty `items` array and omit `itemCount`. These values are not newly enqueued-process counts.
@@ -346,40 +471,111 @@ A failure in `onProcessSucceeded` does not retry a handler that already succeede
 
 ## Singleton lifecycle
 
-`HederaEventSync.create()` uses a process-local singleton by default. If an active singleton already exists, another call returns that instance; the later call's REST client, hook-failure policy, and defaults are not applied. Hooks are replaced separately with `setHooks()` on the returned instance. This prevents separate modules in the same process from accidentally running independent synchronization engines.
+`HederaEventSync.create()` uses a process-local singleton by default. If an active singleton already exists, another call returns that instance; the later call's loader, persistence callback, REST client, hook-failure policy, and defaults are not applied. Hooks are replaced separately with `setHooks()` on the returned instance. This prevents separate modules in the same process from accidentally running independent synchronization engines.
 
-The guarded singleton remains reserved until shutdown has completely settled. A guarded `create()` called during shutdown waits for that shutdown and then creates or returns the single replacement instance. After `await sync.shutdown()` resolves, a later guarded `create()` constructs a new instance normally.
+The guarded singleton remains reserved until shutdown has completely settled, even if its caller has already received `LifecycleTimeoutError`. A guarded `create()` called during shutdown waits for the underlying work. If disposal completes, concurrent callers create or return the single replacement instance. If shutdown aborts before disposal (for example, a checkpoint callback finishes after its deadline), they receive the retained instance once the operation settles; inspect its lifecycle state and explicitly recover or retry shutdown. After `await sync.shutdown()` resolves, a later guarded `create()` constructs a new instance normally.
 
 For an application that deliberately manages multiple independent engines, pass `singletonGuard: false` to every such call:
 
 ```ts
 const isolatedSync = await HederaEventSync.create({
   restClient,
+  querySource: () => queries,
   singletonGuard: false,
 });
 ```
 
 ## Lifecycle safety
 
-Lifecycle controls must not be called while a package-invoked hook, handler, normalizer, resolver, or `read.until` callback belonging to the same synchronizer is active. The operation could otherwise wait for its own callback. Such calls reject with `LifecycleReentrancyError` even if you omit `await` or use `void`.
+Lifecycle controls must not be called from an active package-invoked loader, persistence callback, hook, handler, normalizer, resolver, log filter, or `read.until` callback belonging to the same synchronizer, including asynchronous work still executing in that callback's context. The operation could otherwise wait for its own callback. Such calls reject with `LifecycleReentrancyError` even if you omit `await` or use `void`. External callers can request lifecycle control while callbacks are running; the operation waits for the required work to settle.
 
 If callback-driven control is required, schedule it after the callback returns and handle the resulting promise.
 
-Only short internal state transitions use the global mutation lock. Hooks and runtime start/stop work do not hold it, so operations for different query IDs can progress independently. A conflicting operation for a query already changing state rejects with `LifecycleBusyError`; retry it after the active operation settles.
+Instance-wide lifecycle work is serialized by a gate. Conflicting lifecycle or per-query control calls reject with `LifecycleBusyError`; retry only after the active operation settles. A timed-out callback retains ownership until it settles, so timeout cannot create overlapping generations.
 
-`shutdown()` and `removeQuery()` abort active Mirror Node pagination, signal active handlers through `context.signal`, wait for loops and ordered hook notifications, and then release in-memory state.
+Replacement holds new work and lets active reads, handlers, and ordered hooks settle before collecting processed checkpoints and invoking `beforeReplace`. Queues are discarded only after that boundary succeeds. Successful restart/reload preserves the administrative read and processing holds independently, including for new queries. A failure after entering replacement holds both sides for recovery; partial replacement also sets `recoveryRequired`, which blocks every global resume scope until a successful restart/reload.
 
-Application-callback cancellation is cooperative: lifecycle methods cannot forcibly terminate user code and wait for active handlers, normalizers, resolvers, predicates, and ordered hooks to settle. Handlers should observe `context.signal`; any awaited callback that never settles can prevent shutdown or removal from completing.
+`pauseAll` and `resumeAll` accept the exported `GlobalPauseOptions`, whose `scope` uses `GlobalPauseScope`: `"read"`, `"process"`, or `"both"` (default). Read-only pause cancels and settles active reads while queued processing may drain. Processing-only pause waits for the active handler and ordered processing observers; readers remain eligible until capacity/backpressure applies. Both-scope pause installs both gates before waiting. Each administrative hold is independent: `pauseAll(); resumeAll({ scope: "read" })` leaves processing held. Global resume does not clear independent manual/failure pauses, failure counters, predicate pauses, or capacity restrictions.
+
+`LifecycleState.globalReadPaused` and `.globalProcessPaused` report effective global holds: the corresponding administrative hold **or** the lifecycle maintenance hold. `globalPaused` is their conjunction, so it is false during a single-side pause; `maintenanceHeld` exposes the maintenance hold separately. These fields do not replace per-query statuses. An active pause/resume `operation` includes its resolved `scope` alongside `name`, epoch-millisecond `startedAt`, and `timedOut`. See [lifecycle coordination](lifecycle.md#read-and-processing-holds) for examples and recovery rules.
+
+Application-callback cancellation is cooperative. `shutdown()` first holds new work and waits for active handlers and observers to settle before disposal; it does not force-cancel a handler to meet the caller's deadline. Use `timeoutMs` (1 through 2,147,483,647 milliseconds) for caller-visible lifecycle deadlines, observe provided abort signals, and give external services their own deadlines. A hung handler may keep the lifecycle gate blocked after the caller times out; inspect `getLifecycleState()` and the query statuses. Do not launch another in-process owner for that work.
 
 Pause and resume methods fulfill only after reaching their requested state. If a concurrent failure or stop wins the transition, the method rejects with the terminal state and its recorded reason instead of falsely reporting success.
 
-All four pause/resume controls reject once synchronizer shutdown begins, including after shutdown completes. On an active instance, a control call for a missing query ID remains a no-op.
+All four per-query pause/resume controls reject while shutdown is in progress and after the synchronizer has closed. If shutdown fails before disposal, wait for the active operation to settle and inspect the retained instance's lifecycle state before recovery. On an active instance, a control call for a missing query ID remains a no-op.
 
 ## Advanced public APIs
 
-- `define()` preserves literal query types while normalizing one query or a query array to a readonly array.
-- `RestClient` is the package's low-level synchronization facade over `HederaRestClient`; its optional constructor settings use `RestClientOptions`. Most applications should use `HederaEventSync`.
-- `LogEventProcessor` supports strict preparation and direct execution outside a managed query runtime.
+### Query definition helper
+
+`define(query)` returns a readonly one-element tuple, and `define(queries)` preserves a readonly array's inferred query types. It only normalizes the container shape: it does not validate, copy, freeze, register, or start the queries. Validation happens through `validateQuery()`, `start()`, or `reloadQueries()`.
+
+### Standalone log processing
+
+`new LogEventProcessor(runtime)` requires a `LogProcessorRuntime`: `{ registry, restClient, network, provider }`, with optional `queryId` and `now`. `restClient` is the configured `HederaRestClient`, not the package's `RestClient` facade. An omitted `queryId` becomes `null` in handler context; `now` defaults to `Date.now`.
+
+| Method | Result |
+| --- | --- |
+| `prepare(log, options)` | `Promise<PreparedLogProcess \| null>`; decode, resolve and normalize without executing the handler |
+| `execute(prepared, options?)` | `Promise<void>`; invoke the handler captured by preparation |
+| `prepareAndExecute(log, prepareOptions, executionOptions?)` | Prepare and execute immediately; return the prepared record or `null` |
+
+`log` must already be a normalized `SyncContractLog`; the [REST facade](#low-level-rest-facade) supplies this shape. Preparation options (`LogPrepareOptions`) require `abi` and accept `contract`, `skipEventNames`, `logFilter`, `contractResolver`, and `signal`. Unlike a managed query's address-only resolver, this standalone `contractResolver(log)` receives the complete read-only normalized log. Its result overlays the base `contract` metadata; an absent address falls back to the source log's address. A `false` result from `logFilter` or exclusion of a decoded event returns `null`; a thrown/rejected filter error propagates.
+
+Execution options (`LogExecutionOptions`) accept `signal` and `addStep`. A `PreparedLogProcess` contains `{ eventName, data, rawLog, contract, handler }`; it is an in-process object containing a handler reference, not a portable durable queue record.
+
+This function uses the registry and ABI from the [typed transfer example](queries.md#single-contract-events-with-types):
+
+```ts
+import { HederaRestClient, LogEventProcessor, type SyncContractLog } from "@davincigraph/hedera-event-sync";
+
+const processor = new LogEventProcessor({
+  registry: sync.registry,
+  restClient: new HederaRestClient({ defaultProvider: "public", defaultNetwork: "testnet" }),
+  provider: "public",
+  network: "testnet",
+});
+
+async function processLog(log: SyncContractLog, signal: AbortSignal) {
+  return processor.prepareAndExecute(
+    log,
+    { abi: transferAbi, signal },
+    { signal, addStep: (step) => { console.log(step.title); } },
+  );
+}
+```
+
+Standalone processing supplies no polling, queue, deduplication, retries, checkpoints, hooks, or lifecycle coordination. The caller owns those responsibilities and catches rejected preparation/execution promises. Cancellation is cooperative; supplying a signal does not forcibly terminate application callbacks.
+
+### Low-level REST facade
+
+`new RestClient(client, options?)` wraps a configured `HederaRestClient`. `RestClientOptions` contains `{ debug?: boolean }` (default `false`); the underlying client remains available as the readonly `client` property. The facade does not own or close it.
+
+| Method | Parameter type and required fields | Result |
+| --- | --- | --- |
+| `fetchGlobalLogs(params)` | `GlobalLogsParams`: `provider`, `network`, `cursor`, `batchSize` | `Promise<GlobalContractLogsPage>` |
+| `fetchContractLogs(params)` | `ContractLogsParams`: the same fields plus `address` | `Promise<SyncContractLogsPage>` |
+| `fetchTransactions(params)` | `RestClientTransactionsParams`: `provider`, `network`, `accountId`, `timestampGte`, `pageSize` | `Promise<SyncTransactionsPage>` |
+
+All methods accept optional `timestampLte` and `signal`. Log methods additionally accept `topics` and `timestampGte`, defaulting the lower timestamp to `cursor.timestamp`. Transaction options also accept `result` and `transactionType` with the same endpoint-filter defaults described above. Requests are ascending and use inclusive timestamp bounds. The facade does **not** exclude records at `cursor.index`; managed readers apply exclusive-cursor filtering separately.
+
+Responses contain validated normalized records and the REST client's continuation API. `page.next.url()` returns the next URL or `null`, and `await page.next({ signal })` returns the next normalized page or `null`. A first page may expose `syncWindowEnd` for its bounded time window. Topic-filtered log requests are bounded to the usable seven-day range even when a larger upper range was requested. The facade alone does not advance to the next window or implement overlap replay.
+
+### Error classes
+
+All exported errors extend `Error` and set their corresponding `name`. They can be imported from the package root:
+
+| Class | Meaning / additional fields |
+| --- | --- |
+| `DecodeError` | A log cannot be decoded under the supported ABI rules |
+| `NormalizationError` | A log handler's normalizer threw or rejected |
+| `HandlerError` | A suitable concrete handler is missing |
+| `LifecycleReentrancyError` | Control was invoked from an active callback; exposes `operation` and `callback: { kind, name, queryId }` |
+| `LifecycleBusyError` | Conflicting control is still active; exposes `operation`, `queryId` (`-1` for instance-wide conflicts), and `activeOperation` |
+| `LifecycleTimeoutError` | A caller deadline expired; exposes `operation` and `timeoutMs`, while underlying work can remain active |
+
+Not every rejection uses one of these classes. Configuration failures, transport errors, filters/resolvers, and application handlers can throw other values; catch errors as `unknown`. Stored audit errors are serialized diagnostics rather than instances of these classes.
 
 ## Package exports
 
@@ -389,11 +585,24 @@ The root export contains the synchronizer, handlers, hooks, query and domain typ
 - `@davincigraph/hedera-event-sync/types/domain`
 - `@davincigraph/hedera-event-sync/core/logs/LogEventProcessor`
 
+Import type-only contracts with `import type`. Useful groups include:
+
+| Area | Exported types |
+| --- | --- |
+| Construction and lifecycle | `HederaEventSyncOptions`, `QuerySource`, `QuerySourceContext`, `BeforeReplaceContext`, `LifecycleOperationOptions`, `LifecycleOperation`, `LifecycleState`, `GlobalPauseOptions`, `GlobalPauseScope` |
+| Query configuration | `QueryConfig`, `RuntimeQueryConfig`, `QueryConfigOf<Kind>`, `RuntimeQueryConfigOf<Kind>`, `QueryStartState`, `QueryKind`, `QueryStatus`, `ReadCommon`, `ReadConsistency`, `ProcessBase`, `ContractMeta`, source-specific parameter types |
+| Inspection and history | `ListQueriesOptions`, `Page<T>`, `Cursor`, `ProcessedCheckpoint`, `Process`, `ProcessWithoutPayload`, `ProcessTry`, `ProcessStep`, `ReadCycleAudit` |
+| Handler callbacks | `LogHandler`, `TransactionHandler`, `HandlerContext`, `LogHandlerContext`, `TransactionHandlerContext`, `HandlerKey`, `ProcessHandler` |
+| Hook callbacks | `SyncHooks`, `SyncHookName`, `HookFailure`, `HookFailurePolicy`, `HookFailureScope`, `QueryHookContext`, `ReadCycleResult`, `ReadonlyCallbackValue<T>` |
+| Normalized Mirror Node data | `SyncContractLog`, `SyncContractLogsPage`, `SyncTransaction`, `SyncTransactionsPage`, `SyncReadItem` |
+
+`NetworkName`, `ProviderName`, `TransactionResultFilter`, and `TransactionTypes` are re-exported from the REST dependency. Other REST-client configuration/error types belong to `@davincigraph/hedera-rest-client` and are not all re-exported here. Internal jobs, queues, stores, and utilities have no supported deep-import paths.
+
 ## Troubleshooting
 
 | Symptom | What to check |
 | --- | --- |
-| Nothing appears | Install hooks before `addQuery()`; verify the provider/network, real contract/account, ABI, and topic values. Allow for startup delay, polling cadence, finality lag, and Mirror Node indexing. |
+| Nothing appears | Install hooks and handlers before `start()`; verify the provider/network, real contract/account, ABI, and topic values. Allow for startup delay, polling cadence, finality lag, and Mirror Node indexing. |
 | Old events are missing | A current starting cursor is live-only. Choose an earlier cursor for backfill; the package cannot recover records absent from the selected mirror. |
 | Much more history is being read than expected | Omitted timestamp/index default to zero. Supply an explicit starting cursor. |
 | Reading pauses | Inspect `getReadStatus(id)?.status.info` and `onReadFailure`. Check capacity/backpressure, failure thresholds, hook policy, `read.until`, and operator pauses. |
@@ -408,3 +617,13 @@ The root export contains the synchronizer, handlers, hooks, query and domain typ
 | Imports or TypeScript execution fail | Use ESM; run the README's `.mjs` example with Node. TypeScript consumers need 5.4+. Use only the [documented exports](#package-exports). |
 
 For durable observability, forward hooks to storage or your monitoring system. This package does not provide a UI, HTTP server, or durable history database.
+
+## Safe query editing
+
+`validateQuery(config, initialState?)` returns a normalized detached configuration without registering it, calling hooks, or making network requests. `QueryConfig.initialState` supplies initial per-side `RUNNING`/`PAUSED` states; transition and terminal states are rejected. Validation does not prove provider reachability or handler registration.
+
+Write a complete candidate configuration to your application's source and call `reloadQueries()`. The engine validates the complete catalog before disruption, preserves per-query pause ownership and safe processed checkpoints, and awaits `beforeReplace` before releasing old queued data. A loader/persistence error must propagate; do not convert it into an empty catalog or swallow it in the persistence adapter.
+
+The package does not transact with application storage. Durable editors must serialize source writes, enforce authorization, and implement transaction/rollback/recovery policy in their source and `beforeReplace` adapter. Persist timestamp strings and indexes without converting fractional timestamps to numbers. Never save `getReadStatus(id).cursor` as the processed checkpoint.
+
+See [lifecycle coordination](lifecycle.md) for static/database/file loaders and failure behavior, and [migration from 1.x](migration-v2.md) for removed APIs.

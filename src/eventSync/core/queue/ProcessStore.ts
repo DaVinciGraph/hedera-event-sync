@@ -112,7 +112,7 @@ export class ProcessStore {
 	}
 
 	getFailed(queryId: number): Process | undefined {
-		// At any point we expect at most one Failed process per query; return the latest if present.
+		// Ordered processing leaves at most one failed item per query; select the latest if present.
 		let candidate: Process | undefined;
 		for (const p of this.processes.values()) {
 			if (p.queryId !== queryId) continue;
@@ -154,8 +154,7 @@ export class ProcessStore {
 		const queued = all.filter((p) => p.status === "Queued" && (!center || p.id !== center.id)).sort(cmp);
 		const processed = all.filter((p) => p.status === "Processed" && (!center || p.id !== center.id)).sort(cmp);
 
-		// For queued items we want the next ones that will be processed (earliest first),
-		// not the farthest-out entries. Grab from the head of the sorted array.
+		// Select the earliest queued items to show the next records awaiting processing.
 		const queuedSlice = queued.slice(0, size);
 		const processedSlice = processed.slice(-size);
 

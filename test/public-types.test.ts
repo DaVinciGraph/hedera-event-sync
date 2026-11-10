@@ -14,6 +14,7 @@ import {
 	type HandlerKey,
 	type LogPrepareOptions,
 	type LogHandler,
+	type ListQueriesOptions,
 	type NetworkName,
 	type Process,
 	type ProcessWithoutPayload,
@@ -27,6 +28,8 @@ import {
 	type SyncReadItem,
 	type SyncTransaction,
 	type TransactionHandler,
+	type TransactionsParams,
+	type TransactionTypes,
 } from "../src/index";
 
 const customNetwork: NetworkName = "private-mirror-network";
@@ -61,6 +64,14 @@ const transactionHandler: TransactionHandler = {
 
 const standalonePrepareOptions: LogPrepareOptions = {
 	abi,
+	logFilter(log, signal) {
+		const cancellation: AbortSignal | undefined = signal;
+		// @ts-expect-error Filter source logs are recursively read-only.
+		log.address = "0x0000000000000000000000000000000000000000";
+		// @ts-expect-error Filter topic arrays are read-only.
+		log.topics.push("0x01");
+		return !cancellation?.aborted;
+	},
 	contractResolver(log) {
 		const address: string = log.address;
 		// @ts-expect-error Standalone resolver source logs are recursively read-only.
@@ -165,6 +176,12 @@ const readonlyHooks: SyncHooks = {
 			// Callable configuration values retain their callable API.
 			void query.params.contractResolver?.("0x0000000000000000000000000000000000000000");
 		}
+		if (query.type === "Transactions") {
+			const filter: TransactionTypes | undefined = query.params.transactionType;
+			void filter;
+			// @ts-expect-error Hook source filters are read-only with the rest of the query snapshot.
+			query.params.transactionType = "CONTRACTCALL";
+		}
 		// @ts-expect-error Hook query snapshots are recursively read-only.
 		query.title = "changed";
 		// @ts-expect-error Nested query settings are read-only.
@@ -259,6 +276,30 @@ function assertProcessInspectionTypes(sync: HederaEventSync, includePayload: boo
 	void failedMetadata;
 	void activeProcess;
 	void failedProcess;
+}
+
+function assertQueryListFilterTypes(sync: HederaEventSync): void {
+	const pausedStates = ["PAUSED", "PAUSING"] as const;
+	const options: readonly ListQueriesOptions[] = [
+		{ readStatus: "PAUSED", processStatus: "RUNNING", search: "station" },
+		{ readStatus: pausedStates, processStatus: ["FAILED", "RUNNING"] as const },
+		{ readStatus: [] as const, processStatus: [] as const },
+		{ readStatus: undefined, processStatus: undefined, search: undefined },
+		{ network: "testnet", contractType: "STATION", readStatus: pausedStates, search: "0.0.98" },
+	];
+	for (const filters of options) sync.listQueries(1, 25, filters);
+	// @ts-expect-error Status names are case-sensitive.
+	sync.listQueries(1, 25, { readStatus: "paused" });
+	// @ts-expect-error Each array member must be a supported runtime status.
+	sync.listQueries(1, 25, { processStatus: ["PAUSED", "UNKNOWN"] as const });
+	// @ts-expect-error Status filters accept names or arrays of names, not numbers.
+	sync.listQueries(1, 25, { readStatus: 1 });
+	// @ts-expect-error A null status is not equivalent to an omitted filter.
+	sync.listQueries(1, 25, { processStatus: null });
+	// @ts-expect-error Search is literal text, not a pattern object.
+	sync.listQueries(1, 25, { search: /station/i });
+	// @ts-expect-error Query ID searches must be provided as text.
+	sync.listQueries(1, 25, { search: 1 });
 }
 
 class SynchronousArgsLogHandler extends ArgsLogHandler<unknown, number> {
@@ -454,7 +495,16 @@ const config: QueryConfig = {
 	id: 1,
 	title: "types",
 	read: { fetch: { network: customNetwork, restProvider: "custom-provider" }, pauseAfterConsecutiveFailures: 2 },
-	params: { topics, contractResolver: async (address) => ({ address, id: "0.0.1", type: "Example", version: 0 }) },
+	params: {
+		topics,
+		contractResolver: async (address) => ({ address, id: "0.0.1", type: "Example", version: 0 }),
+		async logFilter(log, signal) {
+			const cancellation: AbortSignal | undefined = signal;
+			// @ts-expect-error Managed filter source logs are recursively read-only.
+			log.topics[0] = "0x01";
+			return !cancellation?.aborted && log.address.length > 0;
+		},
+	},
 	abi,
 	process: { pauseAfterConsecutiveFailures: 2, skipEventNames: ["Ignored"] as const },
 };
@@ -475,9 +525,25 @@ const transactionConfig: QueryConfig = {
 	id: 3,
 	title: "account transactions",
 	read: { fetch: { network: customNetwork, restProvider: "custom-provider" }, pauseAfterConsecutiveFailures: 2 },
-	params: { accountId: "0.0.98", timestamp: "1", index: 2 },
+	params: { accountId: "0.0.98", timestamp: "1", index: 2, transactionType: "CONTRACTCALL" },
 	process: { pauseAfterConsecutiveFailures: 2, skipTransactionTypes: ["TOKENMINT"] as const },
 };
+
+const transactionFilters: readonly TransactionsParams[] = [
+	{ accountId: "0.0.98" },
+	{ accountId: "0.0.98", transactionType: "CONTRACTCALL" },
+	{ accountId: "0.0.98", transactionType: "FutureForkTransaction" },
+];
+// @ts-expect-error The endpoint filter is one type, not an array of handler names.
+const multipleTransactionTypes: TransactionsParams = { accountId: "0.0.98", transactionType: ["CONTRACTCALL"] };
+// @ts-expect-error Null is not a transaction type filter.
+const nullTransactionType: TransactionsParams = { accountId: "0.0.98", transactionType: null };
+// @ts-expect-error Transaction type filters must be strings.
+const numericTransactionType: TransactionsParams = { accountId: "0.0.98", transactionType: 1 };
+void transactionFilters;
+void multipleTransactionTypes;
+void nullTransactionType;
+void numericTransactionType;
 
 void handler;
 void config;
@@ -518,6 +584,7 @@ void assertReadonlyTransactionContext;
 void readonlyHooks;
 void assertTypedAuditItems;
 void assertProcessInspectionTypes;
+void assertQueryListFilterTypes;
 
 // @ts-expect-error Mirror Node log endpoints support no more than four topic positions.
 const tooManyTopics: ContractLogTopicsFilter = ["1", "2", "3", "4", "5"];

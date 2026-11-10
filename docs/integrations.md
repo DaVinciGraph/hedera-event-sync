@@ -107,20 +107,23 @@ function postgresIntegration(pool: Pool, network: string, queryKey: string, quer
     return { timestamp: row.cursor_timestamp, index };
   }
 
+  async function saveCheckpoint(checkpoint: ProcessedCheckpoint) {
+    await pool.query(
+      `INSERT INTO example_sync_checkpoints
+         (network, query_key, cursor_timestamp, cursor_index)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (network, query_key) DO UPDATE
+       SET cursor_timestamp = EXCLUDED.cursor_timestamp, cursor_index = EXCLUDED.cursor_index`,
+      [network, queryKey, checkpoint.timestamp, checkpoint.index],
+    );
+  }
   const hooks: SyncHooks = {
     async onProcessedCheckpoint(query, checkpoint) {
       if (query.id !== queryId || query.read.fetch.network !== network) return;
-      await pool.query(
-        `INSERT INTO example_sync_checkpoints
-           (network, query_key, cursor_timestamp, cursor_index)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (network, query_key) DO UPDATE
-         SET cursor_timestamp = EXCLUDED.cursor_timestamp, cursor_index = EXCLUDED.cursor_index`,
-        [network, queryKey, checkpoint.timestamp, checkpoint.index],
-      );
+      await saveCheckpoint(checkpoint);
     },
   };
-  return { handler, hooks, loadCheckpoint };
+  return { handler, hooks, loadCheckpoint, saveCheckpoint };
 }
 ```
 
@@ -128,7 +131,7 @@ The single transfer insert is atomic and replay-safe. A crash after that insert 
 
 For additional business-table updates, perform the deduplication insert and updates in **one transaction**, using one checked-out client. Apply the updates only when the insert is new. Separate `pool.query()` calls do not form a transaction. See [node-postgres transactions](https://node-postgres.com/features/transactions).
 
-### 3. Restore before adding the query
+### 3. Load the catalog and protect final checkpoints
 
 Append this factory to the same module. It owns one engine and one pool; call it once during application startup, not alongside another owner of the guarded singleton.
 
@@ -153,10 +156,41 @@ export async function startPostgresTransfers(options: {
   );
   let sync: HederaEventSync | undefined;
   try {
-    const saved = await storage.loadCheckpoint(); // Failure stops startup; never silently reset to zero.
     const engine = await HederaEventSync.create({
       restClient: new HederaRestClient({ defaultProvider: "public", defaultNetwork: options.network }),
       hookFailurePolicy: "continue",
+      async querySource({ signal }) {
+        signal.throwIfAborted();
+        const saved = await storage.loadCheckpoint(); // Reject on failure; never silently reset to zero.
+        signal.throwIfAborted();
+        return [{
+          type: "Single-Contract-Logs", id: queryId, title: "Persisted transfers",
+          read: {
+            fetch: { restProvider: "public", network: options.network },
+            pauseAfterConsecutiveFailures: 5,
+          },
+          contract: { address: options.contractId },
+          params: {
+            ...(saved ?? { timestamp: "0.000000000", index: 0 }),
+            topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
+          },
+          abi: [{ type: "event", name: "Transfer", inputs: [
+            { name: "from", type: "address", indexed: true },
+            { name: "to", type: "address", indexed: true },
+            { name: "value", type: "uint256", indexed: false },
+          ] }],
+          process: { pauseAfterConsecutiveFailures: 5 },
+        }];
+      },
+      async beforeReplace({ signal, checkpoints }) {
+        signal.throwIfAborted();
+        for (const { query, checkpoint } of checkpoints) {
+          if (query.id === queryId && query.read.fetch.network === options.network) {
+            await storage.saveCheckpoint(checkpoint); // Required; rejection prevents disposal.
+          }
+        }
+        signal.throwIfAborted();
+      },
     });
     sync = engine;
     engine.registry.registerLog("Transfer", storage.handler);
@@ -167,24 +201,7 @@ export async function startPostgresTransfers(options: {
       onHookError: (failure) => console.error("Observer failed", failure.hook, failure.error),
     };
     engine.setHooks([diagnostics, storage.hooks, ...(options.observers ?? [])]);
-    await engine.addQuery({
-      type: "Single-Contract-Logs", id: queryId, title: "Persisted transfers",
-      read: {
-        fetch: { restProvider: "public", network: options.network },
-        pauseAfterConsecutiveFailures: 5,
-      },
-      contract: { address: options.contractId },
-      params: {
-        ...(saved ?? { timestamp: "0.000000000", index: 0 }),
-        topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
-      },
-      abi: [{ type: "event", name: "Transfer", inputs: [
-        { name: "from", type: "address", indexed: true },
-        { name: "to", type: "address", indexed: true },
-        { name: "value", type: "uint256", indexed: false },
-      ] }],
-      process: { pauseAfterConsecutiveFailures: 5 },
-    });
+    await engine.start();
     return {
       sync: engine,
       async close() {
@@ -204,7 +221,7 @@ Pass your database URL, real contract ID, and network to `startPostgresTransfers
 
 Use one active owner for each checkpoint key. The table is not a distributed lock. Change the logical key when changing the query's meaning; compatible providers on the same network may share it, different ledgers must not. Do not substitute the read cursor for the processed checkpoint.
 
-Here, checkpoint writes are observational: with `"continue"`, failure is reported but synchronization proceeds. The next restart reuses an older checkpoint and may replay more work. Required transfer writes remain in the handler and must succeed. If checkpoint persistence must stop progress on failure, explicitly choose a different hook-failure policy; understand that optional observers share that engine-level policy.
+Routine checkpoint writes use observer hooks: with `"continue"`, a failure is reported while synchronization proceeds. The `beforeReplace` adapter is a separate required boundary: restart, reload, and shutdown await it before discarding old queued work. Its rejection keeps work held and must be recovered before retrying lifecycle operations. A process crash can still reuse an older checkpoint, so business effects remain idempotent and required writes stay in handlers.
 
 ## Optional email alerts
 
@@ -265,12 +282,15 @@ Hooks expose activity; your application provides the HTTP/WebSocket/SSE transpor
 | Current page activity | `onReadPage`; its count is fetched records, not new processed records |
 | New queued record | `onProcessEnqueued` |
 | Active attempt and incremental steps | `onProcessStarted`, `onStepCreated` |
-| Failed attempt / terminal failed process | `onProcessTryFailed` / `onProcessConsecutiveFailuresReached` |
+| Failed attempt / failure-threshold pause | `onProcessTryFailed` / `onProcessConsecutiveFailuresReached` |
 | Successful processing | `onProcessSucceeded` |
 | Independent read/queue states and reasons | `onQueryStatusChange` |
+| Effective global holds, replacement progress, and recovery state | `getLifecycleState()` plus `getReadStatus` / `getQueueStatus` |
 | Initial/reconnect snapshot | `getReadStatus`, `getQueueStatus`, `getLastReadCycle`, `getProcessingTimeline`, `getStatistics` |
 
 Use network/query scope plus `sourceKey` to reconcile a process across live updates and history. Distinguish attempt numbers and step order; a failed attempt does not always mean the process has exhausted retries. Do not rely on polling to catch short-lived processing states, and do not slow handlers just to animate a UI.
+
+Global holds do not replace each query's independent status or emit their own `onQueryStatusChange` event. Refresh lifecycle and effective per-query snapshots after management operations and on reconnect; poll `getLifecycleState()` while an operation is pending. A read-only global pause can leave processing running, so display `globalReadPaused` and `globalProcessPaused` separately. For a query browser, use `listQueries(page, pageSize, { search, readStatus, processStatus })` to filter effective statuses before pagination; see [query-list filtering](reference.md#query-list-filtering).
 
 Serialize only the fields your UI needs. Raw payloads can contain `bigint`, and diagnostics may contain private application data. Retained in-memory counts are not lifetime totals; use your own durable storage for history. Reconcile snapshots with incoming events on reconnect rather than assuming hooks replay past observations.
 

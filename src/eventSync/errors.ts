@@ -49,10 +49,18 @@ export class LifecycleBusyError extends Error {
 	readonly activeOperation: string;
 
 	constructor(operation: string, queryId: number, activeOperation: string) {
-		super(`Cannot ${operation} query ${queryId} while ${activeOperation} is in progress`);
+		super(`Cannot ${operation}${queryId < 0 ? "" : ` query ${queryId}`} while ${activeOperation} is in progress`);
 		this.name = "LifecycleBusyError";
 		this.operation = operation;
 		this.queryId = queryId;
 		this.activeOperation = activeOperation;
+	}
+}
+
+/** The caller's deadline expired; the lifecycle gate remains occupied until active work settles. */
+export class LifecycleTimeoutError extends Error {
+	constructor(readonly operation: string, readonly timeoutMs: number) {
+		super(`${operation} did not settle within ${timeoutMs}ms; inspect lifecycle state before retrying`);
+		this.name = "LifecycleTimeoutError";
 	}
 }

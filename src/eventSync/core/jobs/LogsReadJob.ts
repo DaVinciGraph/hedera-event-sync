@@ -133,12 +133,14 @@ export class LogsReadJob extends ReadJob {
 		}, this.callbackOwner));
 		const staged: StagedProcess[] = [];
 		const contractResolver = this.queryTyped.type === "Multi-Contract-Logs" ? this.queryTyped.params.contractResolver : undefined;
+		const logFilter = this.queryTyped.type === "Multi-Contract-Logs" ? this.queryTyped.params.logFilter : undefined;
 
 		for (const { log, cursor, sourceKey } of items) {
 			if (signal.aborted) return false;
 
 			const prepared = await processor.prepare(log, {
 				abi: this.queryTyped.abi,
+				logFilter,
 				contract: this.queryTyped.contract,
 				contractResolver: contractResolver ? (rawLog) => contractResolver(rawLog.address) : undefined,
 				skipEventNames,

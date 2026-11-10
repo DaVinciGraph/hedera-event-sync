@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { ContractLogsPage, HederaRestClient, RequestOptions } from "@davincigraph/hedera-rest-client";
+import { HederaRestClient } from "@davincigraph/hedera-rest-client";
+import type { ContractLogsPage, RequestOptions, TransactionTypes } from "@davincigraph/hedera-rest-client";
 import { RestClient } from "../src/eventSync/rest/RestClient";
 import type { ContractLogTopicsFilter } from "../src/eventSync/types/config";
 
@@ -49,6 +50,126 @@ describe("RestClient cancellation", () => {
 });
 
 describe("RestClient transaction filters", () => {
+	it("omits transactiontype by default and preserves transfers on mixed transaction types", async (t) => {
+		const requests: URL[] = [];
+		const transactions = ["CRYPTOTRANSFER", "CONTRACTCALL", "TOKENMINT"].map((name, index) => ({
+			name,
+			consensus_timestamp: `${index + 1}.000000001`,
+			transfers: [{ account: "0.0.1", amount: -100 - index }, { account: "0.0.98", amount: 100 + index }],
+			token_transfers: [{ token_id: "0.0.2", account: "0.0.1", amount: index + 1 }],
+		}));
+		t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+			requests.push(new URL(input instanceof Request ? input.url : input));
+			return Response.json({ transactions, links: { next: null } });
+		});
+		const rest = new RestClient(new HederaRestClient({ defaultProvider: "custom", provider: { custom: { testnet: { url: "https://mirror.example" } } } }));
+
+		const page = await rest.fetchTransactions({
+			provider: "custom", network: "testnet", accountId: "0.0.1", timestampGte: "0.000000000", pageSize: 10,
+		});
+
+		assert.equal(requests.length, 1);
+		assert.equal(requests[0].pathname, "/api/v1/transactions");
+		assert.deepEqual([...requests[0].searchParams.entries()].sort(), [
+			["account.id", "0.0.1"], ["limit", "10"], ["order", "asc"], ["result", "success"], ["timestamp", "gte:0.000000000"],
+		]);
+		assert.deepEqual(page.transactions.map(({ name, transfers, token_transfers }) => ({ name, transfers, token_transfers })),
+			transactions.map(({ name, transfers, token_transfers }) => ({ name, transfers, token_transfers })));
+	});
+
+	for (const transactionType of ["CRYPTOTRANSFER", "CONTRACTCALL", "TOKENMINT"] as const satisfies readonly TransactionTypes[]) {
+		it(`serializes explicit ${transactionType} filtering and preserves the provider's next-page query`, async (t) => {
+			const requests: URL[] = [];
+			const nextLink = `/api/v1/transactions?account.id=0.0.1&timestamp=gt:5.000000000&timestamp=lte:10.000000000&limit=10&order=asc&transactiontype=${transactionType}`;
+			t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+				requests.push(new URL(input instanceof Request ? input.url : input));
+				return Response.json({ transactions: [], links: { next: requests.length === 1 ? nextLink : null } });
+			});
+			const rest = new RestClient(new HederaRestClient({ defaultProvider: "custom", provider: { custom: { testnet: { url: "https://mirror.example" } } } }));
+			const first = await rest.fetchTransactions({
+				provider: "custom", network: "testnet", accountId: "0.0.1", timestampGte: "0.000000000",
+				timestampLte: "10.000000000", pageSize: 10, result: null, transactionType,
+			});
+			await first.next();
+
+			assert.equal(requests.length, 2);
+			assert.equal(requests[0].searchParams.get("transactiontype"), transactionType);
+			assert.deepEqual(requests[0].searchParams.getAll("timestamp"), ["gte:0.000000000", "lte:10.000000000"]);
+			assert.equal(requests[0].searchParams.get("account.id"), "0.0.1");
+			assert.equal(requests[0].searchParams.get("limit"), "10");
+			assert.equal(requests[0].searchParams.get("order"), "asc");
+			assert.equal(requests[0].searchParams.has("result"), false);
+			const expectedNext = new URL(nextLink, "https://mirror.example");
+			assert.equal(requests[1].origin + requests[1].pathname, expectedNext.origin + expectedNext.pathname);
+			assert.deepEqual([...requests[1].searchParams.entries()], [...expectedNext.searchParams.entries()]);
+			assert.equal(first.syncWindowEnd, "10.000000000");
+		});
+	}
+
+	it("rejects malformed explicit type filters before making a request", async () => {
+		const rest = new RestClient({} as HederaRestClient);
+		for (const transactionType of [null, "", "   ", [], {}, 42]) {
+			await assert.rejects(rest.fetchTransactions({
+				provider: "custom", network: "testnet", accountId: "0.0.1", timestampGte: "0.000000000", pageSize: 10,
+				transactionType: transactionType as TransactionTypes,
+			}), /transactionType must be a non-empty string when provided/);
+		}
+	});
+
+	it("trims explicit type filters without changing their case", async () => {
+		const appliedTypes: unknown[] = [];
+		const builder: any = new Proxy({}, { get: (_target, property) => (value?: unknown) => {
+			if (property === "transactionType") appliedTypes.push(value);
+			return builder;
+		} });
+		const client = {
+			useProvider: () => ({ useNetwork: () => ({ transactions: () => ({ list: (initialize: (query: unknown) => unknown) => {
+				initialize(builder);
+				return { get: async () => ({ transactions: [], links: { next: null }, next: Object.assign(async () => null, { url: () => null }) }) };
+			} }) }) }),
+		} as unknown as HederaRestClient;
+		await new RestClient(client).fetchTransactions({
+			provider: "custom", network: "testnet", accountId: "0.0.1", timestampGte: "0.000000000", pageSize: 10,
+			transactionType: "  customType  ",
+		});
+		assert.deepEqual(appliedTypes, ["customType"]);
+	});
+
+	it("forwards signals and propagates request failures with an explicit type filter", async () => {
+		const requests: Array<RequestOptions | undefined> = [];
+		const initialError = new Error("initial request failed");
+		const nextError = new Error("next request failed");
+		let failInitial = true;
+		const builder: any = new Proxy({}, { get: () => () => builder });
+		const page = { transactions: [], links: { next: "next-page" }, next: Object.assign(async (options?: RequestOptions) => {
+			requests.push(options);
+			throw nextError;
+		}, { url: () => "next-page" }) };
+		const client = {
+			useProvider: () => ({ useNetwork: () => ({ transactions: () => ({ list: (initialize: (query: unknown) => unknown) => {
+				initialize(builder);
+				return { get: async (options?: RequestOptions) => {
+					requests.push(options);
+					if (failInitial) throw initialError;
+					return page;
+				} };
+			} }) }) }),
+		} as unknown as HederaRestClient;
+		const rest = new RestClient(client);
+		const initialController = new AbortController();
+		const nextController = new AbortController();
+		const params = {
+			provider: "custom", network: "testnet", accountId: "0.0.1", timestampGte: "0.000000000",
+			pageSize: 10, transactionType: "CONTRACTCALL", signal: initialController.signal,
+		} as const;
+
+		await assert.rejects(rest.fetchTransactions(params), (error) => error === initialError);
+		failInitial = false;
+		const first = await rest.fetchTransactions(params);
+		await assert.rejects(first.next({ signal: nextController.signal }), (error) => error === nextError);
+		assert.deepEqual(requests.map((options) => options?.signal), [initialController.signal, initialController.signal, nextController.signal]);
+	});
+
 	it("keeps successful-only as the default and allows callers to request all results", async () => {
 		const appliedResults: unknown[] = [];
 		const builder: any = new Proxy(

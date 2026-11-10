@@ -1,7 +1,7 @@
 import type { HederaRestClient } from "@davincigraph/hedera-rest-client";
 import type { Abi, AbiEvent } from "abitype";
 import { decodeEventLog, toEventSelector, type Hex } from "viem";
-import type { ContractMeta, NetworkName } from "../../types/config";
+import type { ContractMeta, MultiContractLogsParams, NetworkName } from "../../types/config";
 import type { HandlerRegistry } from "../../handlers/HandlerRegistry";
 import type { HandlerContext, LogHandler, LogHandlerContext } from "../../handlers/types";
 import type { SyncContractLog } from "../../types/mirror";
@@ -24,6 +24,8 @@ export type LogProcessorRuntime = {
 export type LogPrepareOptions = {
 	/** ABI containing the non-anonymous event declaration for this log. */
 	abi: Abi;
+	/** Receives a frozen log snapshot before decoding; false excludes it, errors retry the page. */
+	logFilter?: MultiContractLogsParams["logFilter"];
 	/** Base metadata used during handler selection. */
 	contract?: ContractMeta;
 	/** Optional metadata resolver receiving a recursively read-only view of the normalized log. */
@@ -32,7 +34,7 @@ export type LogPrepareOptions = {
 	) => Pick<ContractMeta, "id" | "address" | "type" | "version"> | undefined | Promise<Pick<ContractMeta, "id" | "address" | "type" | "version"> | undefined>;
 	/** Exact event names excluded only after successful decoding. */
 	skipEventNames?: readonly string[];
-	/** Cooperative signal forwarded to normalizer context. */
+	/** Cooperative signal forwarded to the filter and normalizer context. */
 	signal?: AbortSignal;
 };
 
@@ -61,8 +63,22 @@ export class LogEventProcessor {
 	/** Creates a processor backed by the supplied registry and REST client. */
 	constructor(private readonly runtime: LogProcessorRuntime) {}
 
-	/** Returns `null` only for a successfully decoded event explicitly excluded by name. */
+	/** Returns `null` for a rejected raw log or a decoded event explicitly excluded by name. */
 	async prepare(log: SyncContractLog, options: LogPrepareOptions): Promise<PreparedLogProcess | null> {
+		if (options.logFilter) {
+			options.signal?.throwIfAborted();
+			// Log fields are primitives except for topics. Isolate the filter predicate
+			// from the identity-preserving raw record used by later callbacks.
+			const filterLog = Object.freeze({ ...log, topics: Object.freeze([...log.topics]) });
+			const accepted = await runInUserCallback(
+				{ kind: "filter", name: "logFilter", queryId: this.runtime.queryId ?? null },
+				() => options.logFilter!(filterLog, options.signal),
+				userCallbackOwnerOf(this.runtime)
+			);
+			options.signal?.throwIfAborted();
+			if (typeof accepted !== "boolean") throw new TypeError("logFilter must return a boolean");
+			if (!accepted) return null;
+		}
 		const decoded = this.decodeWithAbi(log, options.abi);
 		const eventName = decoded.eventName;
 		if (options.skipEventNames?.includes(eventName)) return null;

@@ -11,6 +11,7 @@ import { RestClient } from "../rest/RestClient";
 import { snapshotProcess, snapshotQuery } from "../utils/snapshot";
 import type { HookFailure } from "../hooks/SyncHooks";
 import type { StagedProcess } from "./queue/types";
+import type { GlobalPauseScope } from "./HederaEventSync";
 import { errorDetails } from "../utils/error";
 
 export class QueryRuntime {
@@ -23,6 +24,7 @@ export class QueryRuntime {
 
 	private stopped = false;
 	private halted = false;
+	private stoppedCheckpoint?: ProcessedCheckpoint;
 
 	constructor(
 		readonly query: RuntimeQueryConfig,
@@ -67,6 +69,33 @@ export class QueryRuntime {
 		this.queueLoop = this.superviseLoop("processing", this.queue.runLoop());
 	}
 
+	setLifecycleHold(held: boolean, scope: GlobalPauseScope = "both"): void {
+		if (scope !== "process") this.readJob.setLifecycleHold(held);
+		if (scope !== "read") this.queue.setLifecycleHold(held);
+	}
+
+	async settleLifecycleHold(scope: GlobalPauseScope = "both"): Promise<void> {
+		await Promise.all([
+			...(scope !== "process" ? [this.readJob.settleLifecycleHold()] : []),
+			...(scope !== "read" ? [this.queue.settleLifecycleHold()] : []),
+		]);
+	}
+
+	getControlState() {
+		return { read: this.readJob.getControlState(), process: this.queue.getControlState() };
+	}
+
+	restoreControlState(state: ReturnType<QueryRuntime["getControlState"]>): void {
+		// A replacement has fresh loop controllers. Keep a terminal predecessor
+		// held, but make explicit per-stage resume available after the operator fixes it.
+		const recoverable = (status: typeof state.read.status) =>
+			status.name === "FAILED" || status.name === "STOPPED"
+				? { name: "PAUSED" as const, info: status.info ?? `Previous runtime ${status.name.toLowerCase()}` }
+				: status;
+		this.readJob.restoreControlState({ ...state.read, status: recoverable(state.read.status) });
+		this.queue.restoreControlState({ ...state.process, status: recoverable(state.process.status) });
+	}
+
 	async stop(): Promise<void> {
 		if (this.stopped) return;
 		this.stopped = true;
@@ -81,6 +110,18 @@ export class QueryRuntime {
 		await Promise.all([this.readJob.flushHooks(), this.queue.flushHooks()]);
 
 		// Dispose timers/queues and drop stored processes
+		// Capture before disposal: queued records and unfinished replay windows
+		// still constrain the safe restart boundary even after loops have stopped.
+		this.stoppedCheckpoint = this.queue.getProcessedCheckpoint();
+		this.queue.dispose();
+		this.store.clear();
+	}
+
+	/** Discard a staged runtime that was never announced or initialized. No lifecycle hooks escape. */
+	discardUnstarted(): void {
+		if (this.readLoop || this.queueLoop) throw new Error("Cannot discard a started runtime");
+		this.stopped = true;
+		this.stoppedCheckpoint = this.queue.getProcessedCheckpoint();
 		this.queue.dispose();
 		this.store.clear();
 	}
@@ -112,15 +153,15 @@ export class QueryRuntime {
 		return this.queue.getInFlight(!!opts?.includePayload);
 	}
 
-	async pauseRead(): Promise<void> {
-		await this.readJob.pause("admin");
+	async pauseRead(preserveExistingPause = false): Promise<void> {
+		await this.readJob.pause("admin", preserveExistingPause);
 	}
 	async resumeRead(): Promise<void> {
 		await this.readJob.resume();
 	}
 
-	async pauseProcessing(): Promise<void> {
-		await this.queue.pause();
+	async pauseProcessing(preserveExistingPause = false): Promise<void> {
+		await this.queue.pause(undefined, preserveExistingPause);
 	}
 	async resumeProcessing(): Promise<void> {
 		await this.queue.resume();
@@ -139,7 +180,7 @@ export class QueryRuntime {
 	}
 
 	getProcessedCheckpoint(): ProcessedCheckpoint {
-		return this.queue.getProcessedCheckpoint();
+		return this.stoppedCheckpoint ? { ...this.stoppedCheckpoint } : this.queue.getProcessedCheckpoint();
 	}
 
 	listProcesses(page: number, pageSize: number, status?: Process["status"], order: "asc" | "desc" = "asc") {
@@ -170,7 +211,10 @@ export class QueryRuntime {
 	}
 
 	getQuerySnapshot(): RuntimeQueryConfig {
-		return snapshotQuery(this.query);
+		const query = snapshotQuery(this.query);
+		query.read.status = this.readJob.getStatus();
+		query.process.status = this.queue.getStatus();
+		return query;
 	}
 
 	private async superviseLoop(kind: "read" | "processing", loop: Promise<void>): Promise<void> {

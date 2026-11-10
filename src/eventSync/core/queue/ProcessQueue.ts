@@ -21,7 +21,7 @@ import {
 } from "../../utils/timestamp";
 import { associateUserCallbackOwner, runInUserCallback } from "../../utils/userCallback";
 import { errorDetails, serializeError } from "../../utils/error";
-import { sleepWithSignal } from "../../utils/timer";
+import { sleep, sleepWithSignal } from "../../utils/timer";
 
 function createRevocableCallback<T>(initialTarget: ((value: T) => void) | undefined): {
 	callback: (value: T) => void;
@@ -62,6 +62,8 @@ export class ProcessQueue {
 	private pendingMinimumHead = 0;
 	private stepHookChain: Promise<void> = Promise.resolve();
 	private statusHookChain: Promise<void> = Promise.resolve();
+	private lifecycleHeld = false;
+	private restoredFailures = new Map<string, number>();
 
 	constructor(
 		private readonly query: RuntimeQueryConfig,
@@ -177,14 +179,40 @@ export class ProcessQueue {
 	}
 
 	getStatus(): QueryStatus {
-		return { ...this.status };
+		return this.lifecycleHeld && this.status.name === "RUNNING"
+			? { name: this.inFlight ? "PAUSING" : "PAUSED", info: "Processing is paused for the synchronization instance" }
+			: { ...this.status };
+	}
+
+	setLifecycleHold(held: boolean): void { this.lifecycleHeld = held; }
+
+	async settleLifecycleHold(): Promise<void> {
+		while (this.inFlight) await sleep(10);
+		await this.settleStatusTransitions();
+		await this.flushHooks();
+	}
+
+	getControlState() {
+		const failures = new Map(this.restoredFailures);
+		for (const [id, count] of this.consecutiveFailuresFor) {
+			const process = this.store.get(id);
+			if (process) failures.set(process.sourceKey, count);
+		}
+		return { status: { ...this.status }, failures };
+	}
+
+	restoreControlState(state: ReturnType<ProcessQueue["getControlState"]>): void {
+		this.status = { ...state.status };
+		this.query.process.status = this.status;
+		this.lastNotifiedStatus = this.status.name;
+		this.restoredFailures = new Map(state.failures);
 	}
 
 	async runLoop(): Promise<void> {
 		while (!this.stopped) {
 			await this.settleStatusTransitions();
 
-			if (this.status.name !== "RUNNING") {
+			if (this.lifecycleHeld || this.status.name !== "RUNNING") {
 				await this.wait(1000);
 				continue;
 			}
@@ -192,7 +220,7 @@ export class ProcessQueue {
 			let proc: Process | undefined;
 			try {
 				// Lifecycle state can change while the lock is pending; never dequeue after a pause or stop has settled.
-				if (!this.stopped && this.status.name === "RUNNING") proc = this.q.shift();
+				if (!this.stopped && !this.lifecycleHeld && this.status.name === "RUNNING") proc = this.q.shift();
 			} finally {
 				release();
 			}
@@ -211,6 +239,11 @@ export class ProcessQueue {
 	}
 
 	async processOne(proc: Process): Promise<void> {
+		const restoredFailures = this.restoredFailures.get(proc.sourceKey);
+		if (restoredFailures !== undefined) {
+			this.consecutiveFailuresFor.set(proc.id, restoredFailures);
+			this.restoredFailures.delete(proc.sourceKey);
+		}
 		const startedAt = Date.now();
 		const triesBeforeAttempt = [...proc.tries];
 		proc.status = "Processing";
@@ -474,9 +507,9 @@ export class ProcessQueue {
 		return snapshotProcess(proc, includePayload);
 	}
 
-	async pause(reason?: string): Promise<void> {
+	async pause(reason?: string, preserveExistingPause = false): Promise<void> {
 		this.assertControllable("pause");
-		this.pauseReason = reason ?? "admin";
+		if (!preserveExistingPause || (this.status.name !== "PAUSED" && this.status.name !== "PAUSING")) this.pauseReason = reason ?? "admin";
 
 		if (this.status.name === "RUNNING") {
 			this.setStatus("PAUSING", this.pauseReason);
@@ -559,6 +592,7 @@ export class ProcessQueue {
 			this.setStatus("PAUSED", this.pauseReason);
 		} else if (this.status.name === "RESUMING") {
 			this.consecutiveFailuresFor.clear();
+			this.restoredFailures.clear();
 			this.setStatus("RUNNING");
 		}
 

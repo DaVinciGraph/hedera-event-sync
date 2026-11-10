@@ -13,6 +13,7 @@ import { HederaRestClient } from "@davincigraph/hedera-rest-client";
 import type { SyncContractLog, SyncContractLogsPage, SyncTransaction, SyncTransactionsPage } from "../types/mirror";
 import { normalizeHederaTimestamp, parseHederaTimestampNs } from "../utils/timestamp";
 import { boundedTopicLogWindowEnd, hasContractLogTopicFilters } from "../utils/topicLogWindow";
+import { normalizeTransactionType } from "../utils/transactionType";
 
 /** Parameters used by the synchronization engine to read global contract logs. */
 export type GlobalLogsParams = {
@@ -53,6 +54,7 @@ export type RestClientTransactionsParams = {
 	provider: string;
 	network: NetworkName;
 	result?: TransactionResultFilter | null;
+	transactionType?: TransactionTypes;
 	signal?: AbortSignal;
 };
 
@@ -141,6 +143,7 @@ export class RestClient {
 	/** Fetches the first normalized page of transactions for one account identifier. */
 	async fetchTransactions(p: RestClientTransactionsParams): Promise<SyncTransactionsPage> {
 		const { provider, network, accountId, timestampGte, timestampLte, pageSize, result = "success", signal } = p;
+		const transactionType = normalizeTransactionType(p.transactionType);
 		assertTimestampRange(timestampGte, timestampLte);
 		const t = this.client.useProvider(provider).useNetwork(network).transactions();
 
@@ -148,6 +151,7 @@ export class RestClient {
 				let qb = q.accountId(accountId).timestamp().greaterThanOrEqualTo(timestampGte);
 				if (timestampLte) qb = qb.timestamp().lessThanOrEqualTo(timestampLte);
 				if (result !== null) qb = qb.result(result);
+				if (transactionType !== undefined) qb = qb.transactionType(transactionType);
 				qb = qb.limit(pageSize);
 				qb = qb.order("asc");
 				return qb;

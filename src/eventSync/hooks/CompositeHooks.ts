@@ -12,11 +12,11 @@ type HookQuery = Parameters<NonNullable<SyncHooks["onQueryAdded"]>>[0];
 export class CompositeHooks implements SyncHooks {
 	private hooks: readonly SyncHooks[];
 	private readonly policy: HookFailurePolicy;
-	private readonly onFailure?: (failure: HookFailure) => void;
+	private readonly onFailure?: (failure: HookFailure) => void | Promise<void>;
 
 	constructor(
 		hooks: readonly SyncHooks[],
-		options: { policy?: HookFailurePolicy; onFailure?: (failure: HookFailure) => void } = {}
+		options: { policy?: HookFailurePolicy; onFailure?: (failure: HookFailure) => void | Promise<void> } = {}
 	) {
 		this.hooks = [...hooks];
 		this.policy = options.policy ?? "continue";
@@ -109,7 +109,10 @@ export class CompositeHooks implements SyncHooks {
 					// Runtime control must not depend on diagnostic observers settling.
 					// In particular, a blocked onHookError reporter must not postpone a
 					// configured pause or fail-fast transition.
-					this.onFailure?.(failure);
+					// Invoke control immediately, but do not await asynchronous callbacks:
+					// their rejection is contained just like a synchronous throw, and a
+					// callback that never settles must not block reporting or dispatch.
+					void Promise.resolve(this.onFailure?.(failure)).catch(() => {});
 				} catch {
 					// Runtime-control callbacks are part of the same containment boundary.
 				}

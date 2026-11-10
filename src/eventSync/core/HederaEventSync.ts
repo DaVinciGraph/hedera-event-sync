@@ -1,4 +1,4 @@
-import type { ContractLogTopicFilter, NetworkName, QueryConfig, RuntimeQueryConfig } from "../types/config";
+import type { ContractLogTopicFilter, NetworkName, QueryConfig, QueryStatus, QueryStartState, RuntimeQueryConfig } from "../types/config";
 import { HandlerRegistry } from "../handlers/HandlerRegistry";
 import { QueryRuntime } from "./QueryRuntime";
 import type { Process, ProcessedCheckpoint, ProcessWithoutPayload, ReadCycleAudit } from "../types/domain";
@@ -10,10 +10,11 @@ import { HederaRestClient } from "@davincigraph/hedera-rest-client";
 import { AsyncMutex } from "../utils/mutex";
 import { DEFAULTS } from "../constants";
 import { normalizeHederaTimestamp } from "../utils/timestamp";
+import { normalizeTransactionType } from "../utils/transactionType";
 import { snapshotValue } from "../utils/snapshot";
-import { assertOutsideUserCallback } from "../utils/userCallback";
+import { assertOutsideUserCallback, runInUserCallback } from "../utils/userCallback";
 import { errorDetails } from "../utils/error";
-import { LifecycleBusyError } from "../errors";
+import { LifecycleBusyError, LifecycleTimeoutError } from "../errors";
 import { hasContractLogTopicFilters, topicLogOverlapCanAdvance } from "../utils/topicLogWindow";
 import type { AbiEvent } from "abitype";
 import { AbiEvent as OxAbiEvent } from "ox";
@@ -38,14 +39,65 @@ export type ListQueriesOptions = {
 	type?: QueryConfig["type"];
 	/** Optional filter by configured network name. */
 	network?: NetworkName;
+	/** Exact contract metadata type; null matches absent or blank types, undefined matches all. */
+	contractType?: string | null | undefined;
+	/** Effective reader status, including global holds. Arrays match any listed status; an empty array matches none. */
+	readStatus?: QueryStatus["name"] | readonly QueryStatus["name"][] | undefined;
+	/** Effective processor status, combined with the other filters using AND. Arrays match any listed status. */
+	processStatus?: QueryStatus["name"] | readonly QueryStatus["name"][] | undefined;
+	/** Trimmed, case-insensitive literal substring of title, query ID, configured contract ID/address, or transaction account ID. Blank searches match all. */
+	search?: string | undefined;
 	/** Order of results. Default: "insertion" (Map insertion order). */
 	order?: "insertion" | "id-asc" | "id-desc";
 };
+
+type QueryListFilters = {
+	type: QueryConfig["type"] | undefined;
+	network: NetworkName | undefined;
+	contractType: string | null | undefined;
+	readStatuses: ReadonlySet<QueryStatus["name"]> | undefined;
+	processStatuses: ReadonlySet<QueryStatus["name"]> | undefined;
+	search: string | undefined;
+};
+
+export type { QueryStartState } from "../types/config";
+
+export type LifecycleOperationOptions = { timeoutMs?: number };
+export type GlobalPauseScope = "read" | "process" | "both";
+export type GlobalPauseOptions = LifecycleOperationOptions & { scope?: GlobalPauseScope };
+export type LifecycleOperation = "start" | "pauseAll" | "resumeAll" | "restartQueries" | "reloadQueries" | "shutdown";
+export type LifecycleState = Readonly<{
+	started: boolean;
+	closed: boolean;
+	generation: number;
+	/** True only when both stages are globally held, including maintenance. */
+	globalPaused: boolean;
+	/** Effective global holds, independent of each query's own pause reasons. */
+	globalReadPaused: boolean;
+	globalProcessPaused: boolean;
+	/** Internal replacement/shutdown hold; scoped resume cannot release it. */
+	maintenanceHeld: boolean;
+	/** A retired/partially initialized generation needs a successful restart or reload before release. */
+	recoveryRequired: boolean;
+	operation?: Readonly<{ name: LifecycleOperation; startedAt: number; timedOut: boolean; scope?: GlobalPauseScope }>;
+	lastError?: string;
+}>;
+export type QuerySourceContext = Readonly<{ signal: AbortSignal; reason: "start" | "reload" }>;
+export type QuerySource = (context: QuerySourceContext) => readonly QueryConfig[] | Promise<readonly QueryConfig[]>;
+export type BeforeReplaceContext = Readonly<{
+	signal: AbortSignal;
+	reason: "restart" | "reload" | "shutdown";
+	checkpoints: readonly Readonly<{ query: RuntimeQueryConfig; checkpoint: Readonly<ProcessedCheckpoint> }>[];
+}>;
 
 /** Construction options for the synchronization engine. */
 export type HederaEventSyncOptions = {
 	/** Configured REST client used by every query runtime in this instance. */
 	restClient: HederaRestClient;
+	/** Complete authoritative query catalog. Invoked only by start() and reloadQueries(). */
+	querySource: QuerySource;
+	/** Await durable checkpoints before retiring a generation. Rejection leaves the old runtimes held. */
+	beforeReplace?: (context: BeforeReplaceContext) => void | Promise<void>;
 	/**
 	 * Keeps `create()` process-wide by default. While the guarded instance is
 	 * active, later calls return it and do not apply their supplied options. A
@@ -83,11 +135,8 @@ type ResolvedDefaults = {
 	overlapSeconds: number;
 };
 
-type QueryLifecyclePhase = "addQuery" | "updateQuery" | "removeQuery" | "pauseRead" | "resumeRead" | "pauseProcessing" | "resumeProcessing";
-type QueryLifecycleState = {
-	phase: QueryLifecyclePhase;
-	candidate?: RuntimeQueryConfig;
-};
+type QueryLifecyclePhase = "pauseRead" | "resumeRead" | "pauseProcessing" | "resumeProcessing";
+type QueryLifecycleState = { phase: QueryLifecyclePhase };
 
 /**
  * Coordinates Mirror Node readers, ordered processing queues, handlers, hooks,
@@ -101,7 +150,21 @@ export class HederaEventSync {
 	private readonly callbackOwner: object;
 	private readonly queryLifecycles = new Map<number, QueryLifecycleState>();
 	private shutdownPromise?: Promise<void>;
+	/** Underlying shutdown work, which can outlive the caller-visible deadline. */
+	private shutdownCompletion?: Promise<void>;
 	private closed = false;
+	private started = false;
+	private generation = 0;
+	private globalReadPaused = false;
+	private globalProcessPaused = false;
+	private maintenanceHeld = false;
+	private recoveryRequired = false;
+	private instanceOperation?: { name: LifecycleOperation; startedAt: number; timedOut: boolean; scope?: GlobalPauseScope };
+	private lastLifecycleError?: string;
+	private readonly catalog = new Map<number, RuntimeQueryConfig>();
+	private readonly querySource: QuerySource;
+	private readonly beforeReplace?: HederaEventSyncOptions["beforeReplace"];
+
 
 	private readonly _registry = new HandlerRegistry();
 	private readonly queries = new Map<number, QueryRuntime>();
@@ -110,10 +173,13 @@ export class HederaEventSync {
 
 	/** Replaces the hook observers used for subsequently dispatched events. */
 	setHooks(h: SyncHooks | SyncHooks[]): void {
+		if (this.instanceOperation) throw new LifecycleBusyError("setHooks", -1, this.instanceOperation.name);
 		this.hooks.setHooks(Array.isArray(h) ? h : [h]);
 	}
 
 	private constructor(opts: HederaEventSyncOptions) {
+		this.querySource = opts.querySource;
+		this.beforeReplace = opts.beforeReplace;
 		this.hooks = new CompositeHooks([new HookBase()], {
 			policy: opts.hookFailurePolicy,
 			onFailure: (failure) => this.handleHookFailure(failure),
@@ -139,16 +205,18 @@ export class HederaEventSync {
 	 * Later guarded calls do not replace the active instance's options.
 	 */
 	static async create(opts: HederaEventSyncOptions): Promise<HederaEventSync> {
+		if (typeof opts.querySource !== "function") throw new Error("querySource must be a function");
 		const guarded = opts.singletonGuard !== false;
 		if (guarded) {
 			for (;;) {
 				const current = HederaEventSync._instance;
 				if (!current) break;
-				if (!current.shutdownPromise) return current;
+				const shutdown = current.shutdownCompletion ?? current.shutdownPromise;
+				if (!shutdown) return current;
 				assertOutsideUserCallback("create", current.callbackOwner);
 				// Keep the singleton occupied until shutdown has fully settled. A
 				// concurrent create then competes for the one replacement instance.
-				await current.shutdownPromise.catch(() => {});
+				await shutdown.catch(() => {});
 			}
 		}
 		if (opts.hookFailurePolicy !== undefined && !["continue", "pause", "fail-fast"].includes(opts.hookFailurePolicy)) {
@@ -160,145 +228,108 @@ export class HederaEventSync {
 		return inst;
 	}
 
-	/**
-	 * Validates, registers, and starts a query. By default, a query with an
-	 * equivalent normalized runtime configuration is ignored.
-	 */
-	async addQuery(cfg: QueryConfig, skipOnDuplication: boolean = true): Promise<void> {
-		assertOutsideUserCallback("addQuery", this.callbackOwner);
+	/** Loads the initial catalog; construction alone never starts callbacks or network work. */
+	async start(options: LifecycleOperationOptions = {}): Promise<void> {
+		return this.runInstanceOperation("start", options, async (signal) => {
+			if (this.started) return;
+			const candidate = await this.loadCatalog("start", signal);
+			await this.replaceCatalog(candidate, "start", signal);
+		});
+	}
+
+	/** Holds the selected stages across all queries; omitted scope holds both. */
+	async pauseAll(options: GlobalPauseOptions = {}): Promise<void> {
+		const scope = this.globalControlScope(options);
+		return this.runInstanceOperation("pauseAll", options, async () => {
+			if (scope !== "process") this.globalReadPaused = true;
+			if (scope !== "read") this.globalProcessPaused = true;
+			await this.holdRuntimes([...this.queries.values()], scope);
+		}, scope);
+	}
+
+	/** Releases only the selected global holds. Independent query pauses remain. */
+	async resumeAll(options: GlobalPauseOptions = {}): Promise<void> {
+		const scope = this.globalControlScope(options);
+		return this.runInstanceOperation("resumeAll", options, async (signal) => {
+			signal.throwIfAborted();
+			if (this.recoveryRequired || this.maintenanceHeld) throw new Error("The previous replacement did not finish; restart or reload queries before resuming");
+			if (scope !== "process") this.globalReadPaused = false;
+			if (scope !== "read") this.globalProcessPaused = false;
+			this.applyGlobalHolds(this.queries.values());
+		}, scope);
+	}
+
+	/** Rebuilds the accepted catalog from final processed checkpoints, without invoking the source. */
+	async restartQueries(options: LifecycleOperationOptions = {}): Promise<void> {
+		return this.runInstanceOperation("restartQueries", options, async (signal) => {
+			this.assertStarted();
+			await this.replaceCatalog([...this.catalog.values()].map((query) => snapshotValue(query)), "restart", signal);
+		});
+	}
+
+	/** Validates a fresh complete source snapshot before holding any current work. */
+	async reloadQueries(options: LifecycleOperationOptions = {}): Promise<void> {
+		return this.runInstanceOperation("reloadQueries", options, async (signal) => {
+			this.assertStarted();
+			const candidate = await this.loadCatalog("reload", signal);
+			await this.replaceCatalog(candidate, "reload", signal);
+		});
+	}
+
+	getLifecycleState(): LifecycleState {
+		const globalReadPaused = this.globalReadPaused || this.maintenanceHeld;
+		const globalProcessPaused = this.globalProcessPaused || this.maintenanceHeld;
+		return Object.freeze({ started: this.started, closed: this.closed, generation: this.generation, recoveryRequired: this.recoveryRequired,
+			globalPaused: globalReadPaused && globalProcessPaused, globalReadPaused, globalProcessPaused, maintenanceHeld: this.maintenanceHeld,
+			...(this.instanceOperation ? { operation: Object.freeze({ ...this.instanceOperation }) } : {}),
+			...(this.lastLifecycleError ? { lastError: this.lastLifecycleError } : {}) });
+	}
+
+	/** Validates and normalizes without registering a runtime, calling hooks, or making network requests. */
+	validateQuery(cfg: QueryConfig, initialState: QueryStartState = cfg?.initialState ?? {}): RuntimeQueryConfig {
 		this.assertActive();
 		this.validateInputShape(cfg);
 		const resolved = this.toRuntimeConfig(cfg);
 		this.validate(resolved);
-
-		let runtime: QueryRuntime | undefined;
-		let lifecycle: QueryLifecycleState | undefined;
-		let skipped = false;
-		await this.withMutationLock(async () => {
-			this.assertActive();
-			this.assertQueryLifecycleIdle(resolved.id, "addQuery");
-			if (this.queries.has(resolved.id)) throw new Error(`Query ${resolved.id} already exists`);
-			const duplicate = this.findDuplicateQuery(resolved);
-			if (duplicate?.busy) throw new LifecycleBusyError("addQuery", duplicate.queryId, duplicate.busy.phase);
-			if (skipOnDuplication && duplicate) {
-				skipped = true;
-				return;
+		if (!initialState || typeof initialState !== "object" || Array.isArray(initialState)) throw new Error("initialState must be an object");
+		for (const kind of ["read", "process"] as const) {
+			const state = initialState[kind];
+			if (state === undefined) continue;
+			if (!state || typeof state !== "object" || !["RUNNING", "PAUSED"].includes(state.name) || (state.info !== undefined && typeof state.info !== "string")) {
+				throw new Error(`initialState.${kind} must have a RUNNING or PAUSED name and optional string info`);
 			}
-
-			runtime = new QueryRuntime(resolved, this.rest, this._registry, this.hooks, this.callbackOwner);
-			lifecycle = { phase: "addQuery", candidate: resolved };
-			this.queryLifecycles.set(resolved.id, lifecycle);
-			this.queries.set(resolved.id, runtime);
-		});
-		if (skipped || !runtime || !lifecycle) return;
-
-		let announced = false;
-		try {
-			await this.hooks.onQueryAdded?.(resolved);
-			announced = true;
-			await runtime.start();
-		} catch (error) {
-			await runtime.stop().catch(() => {});
-			if (announced) await this.hooks.onQueryRemoved?.(resolved);
-			await this.withMutationLock(async () => {
-				if (this.queries.get(resolved.id) === runtime) this.queries.delete(resolved.id);
-			});
-			throw error;
-		} finally {
-			await this.finishQueryLifecycle(resolved.id, lifecycle);
+			resolved[kind].status = { name: state.name, ...(state.name === "PAUSED" && state.info !== undefined ? { info: state.info } : {}) } as QueryStatus;
 		}
+		return resolved;
 	}
 
-	/** Stops and replaces an existing query runtime with the same query ID. */
-	async updateQuery(cfg: QueryConfig, skipOnDuplication: boolean = true): Promise<void> {
-		assertOutsideUserCallback("updateQuery", this.callbackOwner);
-		this.assertActive();
-		this.validateInputShape(cfg);
-		const resolved = this.toRuntimeConfig(cfg);
-		this.validate(resolved);
-
-		let existing: QueryRuntime | undefined;
-		let lifecycle: QueryLifecycleState | undefined;
-		let skipped = false;
-		await this.withMutationLock(async () => {
-			this.assertActive();
-			this.assertQueryLifecycleIdle(resolved.id, "updateQuery");
-			existing = this.queries.get(resolved.id);
-			if (!existing) throw new Error(`Query ${resolved.id} not found`);
-			const duplicate = this.findDuplicateQuery(resolved, resolved.id);
-			if (duplicate?.busy) throw new LifecycleBusyError("updateQuery", duplicate.queryId, duplicate.busy.phase);
-			if (skipOnDuplication && duplicate) {
-				skipped = true;
-				return;
-			}
-			lifecycle = { phase: "updateQuery", candidate: resolved };
-			this.queryLifecycles.set(resolved.id, lifecycle);
-		});
-		if (skipped || !existing || !lifecycle) return;
-
-		let replacement: QueryRuntime | undefined;
-		let replacementAnnounced = false;
-		try {
-			await existing.stop();
-			await this.hooks.onQueryRemoved?.(existing.query);
-
-			replacement = new QueryRuntime(resolved, this.rest, this._registry, this.hooks, this.callbackOwner);
-			await this.withMutationLock(async () => {
-				this.assertActive();
-				this.queries.set(resolved.id, replacement!);
-			});
-			await this.hooks.onQueryAdded?.(resolved);
-			replacementAnnounced = true;
-			await replacement.start();
-		} catch (error) {
-			await replacement?.stop().catch(() => {});
-			if (replacementAnnounced) await this.hooks.onQueryRemoved?.(resolved);
-			await this.withMutationLock(async () => {
-				const current = this.queries.get(resolved.id);
-				if (current === existing || current === replacement) this.queries.delete(resolved.id);
-			});
-			throw error;
-		} finally {
-			await this.finishQueryLifecycle(resolved.id, lifecycle);
-		}
-	}
-
-	/** Stops and removes a query; missing query IDs are ignored. */
-	async removeQuery(queryId: number): Promise<void> {
-		assertOutsideUserCallback("removeQuery", this.callbackOwner);
-		let runtime: QueryRuntime | undefined;
-		let lifecycle: QueryLifecycleState | undefined;
-		await this.withMutationLock(async () => {
-			if (this.closed) return;
-			this.assertQueryLifecycleIdle(queryId, "removeQuery");
-			runtime = this.queries.get(queryId);
-			if (!runtime) return;
-			lifecycle = { phase: "removeQuery" };
-			this.queryLifecycles.set(queryId, lifecycle);
-		});
-		if (!runtime || !lifecycle) return;
-
-		try {
-			await runtime.stop();
-			await this.hooks.onQueryRemoved?.(runtime.query);
-		} finally {
-			await this.withMutationLock(async () => {
-				if (this.queries.get(queryId) === runtime) this.queries.delete(queryId);
-			});
-			await this.finishQueryLifecycle(queryId, lifecycle);
-		}
-	}
-
-	/** Stops all query runtimes, flushes ordered hooks, and releases in-memory state. */
-	async shutdown(): Promise<void> {
+	/** Quiesces work and confirms durable checkpoints before disposing runtime state. */
+	async shutdown(options: LifecycleOperationOptions = {}): Promise<void> {
 		assertOutsideUserCallback("shutdown", this.callbackOwner);
-		if (!this.shutdownPromise) this.shutdownPromise = this.shutdownInternal();
-		try {
-			await this.shutdownPromise;
-		} catch (error) {
-			this.shutdownPromise = undefined;
-			throw error;
+		if (this.closed) return;
+		if (!this.shutdownPromise) {
+			this.shutdownPromise = this.runInstanceOperation("shutdown", options, async (signal) => {
+				this.globalReadPaused = true;
+				this.globalProcessPaused = true;
+				this.maintenanceHeld = true;
+				try {
+					const runtimes = [...this.queries.values()];
+					await this.holdRuntimes(runtimes);
+					signal.throwIfAborted();
+					await this.persistReplacementCheckpoints(runtimes, "shutdown", signal);
+					signal.throwIfAborted();
+					this.recoveryRequired = true;
+					await this.stopRuntimes(runtimes);
+					this.queries.clear();
+					this.catalog.clear();
+					this.closed = true;
+					this.recoveryRequired = false;
+					if (HederaEventSync._instance === this) HederaEventSync._instance = undefined;
+				} finally { this.maintenanceHeld = this.recoveryRequired; }
+			});
 		}
+		try { await this.shutdownPromise; }
+		catch (error) { this.shutdownPromise = undefined; throw error; }
 	}
 
 	/** Returns every resolved query in insertion order. */
@@ -320,8 +351,7 @@ export class HederaEventSync {
 		const endExclusive = start + ps;
 
 		const order = opts?.order ?? "insertion";
-		const filterType = opts?.type;
-		const filterNetwork = opts?.network;
+		const filters = this.normalizeQueryListFilters(opts);
 
 		// In insertion order, collect only the requested slice to avoid copying every query.
 		let total = 0;
@@ -330,20 +360,19 @@ export class HederaEventSync {
 		if (order === "insertion") {
 			let seen = 0;
 			for (const rt of this.queries.values()) {
-				if (filterType && rt.query.type !== filterType) continue;
-				if (filterNetwork && rt.query.read.fetch.network !== filterNetwork) continue;
+				if (!this.matchesQueryFilters(rt, filters)) continue;
 				if (seen >= start && seen < endExclusive) {
 					items.push(rt.getQuerySnapshot());
 				}
 				seen++;
 			}
-			total = this.countFiltered(filterType, filterNetwork);
+			total = seen;
 		} else {
 			// Sorting IDs avoids materializing full query snapshots outside the requested page.
 			const ids: number[] = [];
 			for (const id of this.queries.keys()) {
 				const q = this.queries.get(id)!;
-				if ((!filterType || q.query.type === filterType) && (!filterNetwork || q.query.read.fetch.network === filterNetwork)) {
+				if (this.matchesQueryFilters(q, filters)) {
 					ids.push(id);
 				}
 			}
@@ -366,8 +395,7 @@ export class HederaEventSync {
 			if (order === "insertion") {
 				let seen = 0;
 				for (const rt of this.queries.values()) {
-					if (filterType && rt.query.type !== filterType) continue;
-					if (filterNetwork && rt.query.read.fetch.network !== filterNetwork) continue;
+					if (!this.matchesQueryFilters(rt, filters)) continue;
 					if (seen >= newStart && seen < newEndExclusive) {
 						items.push(rt.getQuerySnapshot());
 					}
@@ -377,7 +405,7 @@ export class HederaEventSync {
 				const ids: number[] = [];
 				for (const id of this.queries.keys()) {
 					const q = this.queries.get(id)!;
-					if ((!filterType || q.query.type === filterType) && (!filterNetwork || q.query.read.fetch.network === filterNetwork)) {
+					if (this.matchesQueryFilters(q, filters)) {
 						ids.push(id);
 					}
 				}
@@ -401,15 +429,56 @@ export class HederaEventSync {
 		};
 	}
 
-	private countFiltered(type?: QueryConfig["type"], network?: NetworkName): number {
-		if (!type && !network) return this.queries.size;
-		let n = 0;
-		for (const rt of this.queries.values()) {
-			if (type && rt.query.type !== type) continue;
-			if (network && rt.query.read.fetch.network !== network) continue;
-			n++;
+	private normalizeQueryListFilters(opts?: ListQueriesOptions): QueryListFilters {
+		if (opts?.search !== undefined && typeof opts.search !== "string") {
+			throw new TypeError("listQueries search must be a string");
 		}
-		return n;
+		return {
+			type: opts?.type,
+			network: opts?.network,
+			contractType: opts?.contractType,
+			readStatuses: this.normalizeQueryStatusFilter(opts?.readStatus, "readStatus"),
+			processStatuses: this.normalizeQueryStatusFilter(opts?.processStatus, "processStatus"),
+			search: opts?.search?.trim().toLowerCase() || undefined,
+		};
+	}
+
+	private normalizeQueryStatusFilter(value: unknown, field: "readStatus" | "processStatus"): ReadonlySet<QueryStatus["name"]> | undefined {
+		if (value === undefined) return undefined;
+		const statuses: readonly string[] = ["PAUSED", "RUNNING", "PAUSING", "RESUMING", "FAILED", "STOPPED"];
+		const values = typeof value === "string" ? [value] : value;
+		const message = `listQueries ${field} must be a status or an array of statuses: ${statuses.join(", ")}`;
+		if (!Array.isArray(values)) throw new TypeError(message);
+		const normalized = new Set<QueryStatus["name"]>();
+		for (const status of values) {
+			if (typeof status !== "string" || !statuses.includes(status)) throw new TypeError(message);
+			normalized.add(status as QueryStatus["name"]);
+		}
+		return normalized;
+	}
+
+	private matchesQueryFilters(runtime: QueryRuntime, filters: QueryListFilters): boolean {
+		const query = runtime.query;
+		if (filters.type && query.type !== filters.type) return false;
+		if (filters.network && query.read.fetch.network !== filters.network) return false;
+		if (filters.contractType !== undefined) {
+			const actualType = query.contract?.type;
+			const matches = filters.contractType === null
+				? actualType == null || actualType.trim().length === 0
+				: actualType === filters.contractType;
+			if (!matches) return false;
+		}
+		// Use the same effective state as returned snapshots, rather than the
+		// underlying per-query state which does not include instance-wide holds.
+		if (filters.readStatuses && !filters.readStatuses.has(runtime.getReadStatus().status.name)) return false;
+		if (filters.processStatuses && !filters.processStatuses.has(runtime.getQueueStatus().status.name)) return false;
+		if (filters.search) {
+			const search = filters.search;
+			const fields = [query.title, String(query.id), query.contract?.address, query.contract?.id,
+				query.type === "Transactions" ? query.params.accountId : undefined];
+			if (!fields.some(value => typeof value === "string" && value.toLowerCase().includes(search))) return false;
+		}
+		return true;
 	}
 
 	/** Returns a resolved query snapshot without exposing mutable runtime state. */
@@ -427,9 +496,9 @@ export class HederaEventSync {
 	}
 
 	/** Pauses ingestion after cancelling and settling the active read cycle. */
-	async pauseRead(queryId: number): Promise<void> {
+	async pauseRead(queryId: number, options: { preserveExistingPause?: boolean } = {}): Promise<void> {
 		assertOutsideUserCallback("pauseRead", this.callbackOwner);
-		await this.withQueryControl(queryId, "pauseRead", (runtime) => runtime.pauseRead());
+		await this.withQueryControl(queryId, "pauseRead", (runtime) => runtime.pauseRead(options.preserveExistingPause === true));
 	}
 
 	/** Resumes ingestion for a paused query. */
@@ -439,9 +508,9 @@ export class HederaEventSync {
 	}
 
 	/** Pauses the processing queue after any active handler settles. */
-	async pauseProcessing(queryId: number): Promise<void> {
+	async pauseProcessing(queryId: number, options: { preserveExistingPause?: boolean } = {}): Promise<void> {
 		assertOutsideUserCallback("pauseProcessing", this.callbackOwner);
-		await this.withQueryControl(queryId, "pauseProcessing", (runtime) => runtime.pauseProcessing());
+		await this.withQueryControl(queryId, "pauseProcessing", (runtime) => runtime.pauseProcessing(options.preserveExistingPause === true));
 	}
 
 	/** Resumes the processing queue for a paused query. */
@@ -532,8 +601,8 @@ export class HederaEventSync {
 
 		for (const rt of this.queries.values()) {
 			totalQueries++;
-			const readStatus = rt.query.read.status.name;
-			const processStatus = rt.query.process.status.name;
+			const readStatus = rt.getReadStatus().status.name;
+			const processStatus = rt.getQueueStatus().status.name;
 			this.countStatus(read, readStatus);
 			this.countStatus(process, processStatus);
 			if (readStatus === "RUNNING" && processStatus === "RUNNING") runningQueries++;
@@ -552,41 +621,6 @@ export class HederaEventSync {
 	/** Shared registry used to resolve log and transaction handlers. */
 	get registry(): HandlerRegistry {
 		return this._registry;
-	}
-
-	private findDuplicateQuery(
-		cfg: RuntimeQueryConfig,
-		excludeQueryId?: number
-	): { queryId: number; busy?: QueryLifecycleState } | undefined {
-		for (const rt of this.queries.values()) {
-			const existing = rt.query;
-			if (excludeQueryId !== undefined && existing.id === excludeQueryId) continue;
-			const lifecycle = this.queryLifecycles.get(existing.id);
-			if (lifecycle?.phase === "removeQuery") {
-				if (this.valuesEqual(this.comparableQuery(existing), this.comparableQuery(cfg))) {
-					return { queryId: existing.id, busy: lifecycle };
-				}
-				continue;
-			}
-			if (lifecycle?.phase === "updateQuery" && lifecycle.candidate) {
-				if (this.valuesEqual(this.comparableQuery(existing), this.comparableQuery(cfg))) {
-					return { queryId: existing.id, busy: lifecycle };
-				}
-				if (this.valuesEqual(this.comparableQuery(lifecycle.candidate), this.comparableQuery(cfg))) {
-					return { queryId: existing.id };
-				}
-				continue;
-			}
-			if (this.valuesEqual(this.comparableQuery(existing), this.comparableQuery(cfg))) return { queryId: existing.id };
-		}
-		return undefined;
-	}
-
-	private comparableQuery(query: RuntimeQueryConfig): unknown {
-		const { id: _id, title: _title, icon: _icon, read, process, ...rest } = query;
-		const { status: _readStatus, ...readConfig } = read;
-		const { status: _processStatus, ...processConfig } = process;
-		return { ...rest, read: readConfig, process: processConfig };
 	}
 
 	private valuesEqual(a: unknown, b: unknown): boolean {
@@ -719,6 +753,9 @@ export class HederaEventSync {
 		}
 
 		if (cfg.type === "Multi-Contract-Logs") {
+			if (cfg.params.logFilter !== undefined && typeof cfg.params.logFilter !== "function") {
+				throw new Error(`Query ${cfg.id} invalid: logFilter must be a function`);
+			}
 			if (cfg.params.contractResolver !== undefined && typeof cfg.params.contractResolver !== "function") {
 				throw new Error(`Query ${cfg.id} invalid: contractResolver must be a function`);
 			}
@@ -730,6 +767,12 @@ export class HederaEventSync {
 		} else {
 			const accountId = cfg.params.accountId;
 			if (typeof accountId !== "string" || !accountId.trim()) throw new Error(`Query ${cfg.id} invalid: accountId is required`);
+			try {
+				const transactionType = normalizeTransactionType(cfg.params.transactionType);
+				if (transactionType !== undefined) cfg.params.transactionType = transactionType;
+			} catch (error) {
+				throw new Error(`Query ${cfg.id} invalid: ${errorDetails(error).message}`);
+			}
 			const index = cfg.params.index ?? 0;
 			if (!Number.isSafeInteger(index) || index < 0) throw new Error(`Query ${cfg.id} invalid: index must be a non-negative safe integer`);
 			cfg.params.index = index;
@@ -868,33 +911,168 @@ export class HederaEventSync {
 		else counts.transitioning++;
 	}
 
-	private async shutdownInternal(): Promise<void> {
-		let runtimes: QueryRuntime[] = [];
-		await this.withMutationLock(async () => {
-			if (this.closed) return;
-			const activeLifecycle = this.queryLifecycles.entries().next().value as [number, QueryLifecycleState] | undefined;
-			if (activeLifecycle) {
-				throw new LifecycleBusyError("shutdown", activeLifecycle[0], activeLifecycle[1].phase);
-			}
-			this.closed = true;
-			runtimes = [...this.queries.values()];
-		});
+	private assertStarted(): void {
+		if (!this.started) throw new Error("Call start() before reloading or restarting queries");
+	}
 
-		try {
-			// QueryRuntime.stop() signals both loops before its first await. Starting
-			// every stop first ensures one slow handler cannot delay cancellation of
-			// the other queries.
-			const stopResults = await Promise.allSettled(runtimes.map((runtime) => runtime.stop()));
-			for (const runtime of runtimes) await this.hooks.onQueryRemoved?.(runtime.query);
-			const failedStop = stopResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
-			if (failedStop) throw failedStop.reason;
-		} finally {
-			await this.withMutationLock(async () => {
-				this.queries.clear();
-				this.queryLifecycles.clear();
-			});
-			if (HederaEventSync._instance === this) HederaEventSync._instance = undefined;
+	private async loadCatalog(reason: "start" | "reload", signal: AbortSignal): Promise<RuntimeQueryConfig[]> {
+		const source = await runInUserCallback({ kind: "querySource", name: "querySource", queryId: null },
+			() => this.querySource(Object.freeze({ reason, signal })), this.callbackOwner);
+		signal.throwIfAborted();
+		if (!Array.isArray(source)) throw new Error("querySource must return an array of query configurations");
+		const ids = new Set<number>();
+		const candidate: RuntimeQueryConfig[] = [];
+		// Validate every position: Array.map would skip holes and pass an invalid
+		// catalog into replacement after the existing runtimes have been held.
+		for (let index = 0; index < source.length; index++) {
+			const query = this.validateQuery(source[index]);
+			if (ids.has(query.id)) throw new Error(`Query ${query.id} occurs more than once in querySource`);
+			ids.add(query.id);
+			const existing = this.catalog.get(query.id);
+			if (existing && !this.valuesEqual(this.sourceIdentity(existing), this.sourceIdentity(query))) {
+				throw new Error(`Query ${query.id} changes its source identity; use a new query ID for a different source`);
+			}
+			candidate.push(query);
 		}
+		return candidate;
+	}
+
+	private sourceIdentity(query: RuntimeQueryConfig): unknown {
+		return { type: query.type, network: query.read.fetch.network,
+			address: query.type === "Single-Contract-Logs" ? query.contract.address.toLowerCase() : undefined,
+			...(query.type === "Transactions" ? { accountId: query.params.accountId, result: query.params.result, transactionType: query.params.transactionType }
+				: { topics: query.params.topics }) };
+	}
+
+	private globalControlScope(options: GlobalPauseOptions): GlobalPauseScope {
+		if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("Global pause options must be an object");
+		const scope = options.scope === undefined ? "both" : options.scope;
+		if (scope !== "read" && scope !== "process" && scope !== "both") throw new Error("scope must be read, process, or both");
+		return scope;
+	}
+
+	private applyGlobalHolds(runtimes: Iterable<QueryRuntime>): void {
+		for (const runtime of runtimes) {
+			runtime.setLifecycleHold(this.globalReadPaused || this.maintenanceHeld, "read");
+			runtime.setLifecycleHold(this.globalProcessPaused || this.maintenanceHeld, "process");
+		}
+	}
+
+	private async holdRuntimes(runtimes: readonly QueryRuntime[], scope: GlobalPauseScope = "both"): Promise<void> {
+		// Set every gate before awaiting one callback, so a blocked query cannot leave others running.
+		for (const runtime of runtimes) runtime.setLifecycleHold(true, scope);
+		const settled = await Promise.allSettled(runtimes.map((runtime) => runtime.settleLifecycleHold(scope)));
+		const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (failure) throw failure.reason;
+	}
+
+	private async persistReplacementCheckpoints(runtimes: readonly QueryRuntime[], reason: BeforeReplaceContext["reason"], signal: AbortSignal): Promise<void> {
+		if (!this.beforeReplace) return;
+		const checkpoints = runtimes.map((runtime) => Object.freeze({
+			query: runtime.getQuerySnapshot(), checkpoint: Object.freeze(runtime.getProcessedCheckpoint()) }));
+		await runInUserCallback({ kind: "checkpoint", name: "beforeReplace", queryId: null },
+			() => this.beforeReplace!(Object.freeze({ reason, signal, checkpoints: Object.freeze(checkpoints) })), this.callbackOwner);
+	}
+
+	private async stopRuntimes(runtimes: readonly QueryRuntime[], announce = true): Promise<void> {
+		const settled = await Promise.allSettled(runtimes.map((runtime) => runtime.stop()));
+		const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (failure) throw failure.reason;
+		if (announce) for (const runtime of runtimes) await this.hooks.onQueryRemoved?.(runtime.query);
+	}
+
+	private async replaceCatalog(candidate: RuntimeQueryConfig[], reason: "start" | "restart" | "reload", signal: AbortSignal): Promise<void> {
+		signal.throwIfAborted();
+		const oldRuntimes = [...this.queries.values()];
+		const staged = new Map<number, QueryRuntime>();
+		let installed = false;
+		try {
+			this.maintenanceHeld = true;
+			await this.holdRuntimes(oldRuntimes);
+			signal.throwIfAborted();
+			for (const config of candidate) {
+				const resolved = snapshotValue(config);
+				const old = this.queries.get(config.id);
+				if (old) Object.assign(resolved.params, old.getProcessedCheckpoint());
+				const runtime = new QueryRuntime(resolved, this.rest, this._registry, this.hooks, this.callbackOwner);
+				runtime.setLifecycleHold(true);
+				if (old) runtime.restoreControlState(old.getControlState());
+				staged.set(config.id, runtime);
+			}
+			if (reason !== "start") await this.persistReplacementCheckpoints(oldRuntimes, reason, signal);
+			signal.throwIfAborted();
+			this.recoveryRequired = true;
+			await this.stopRuntimes(oldRuntimes);
+			// Even if the caller's deadline expired while stop hooks settled, install
+			// the prepared, held runtimes. The disposed generation cannot be resumed.
+			this.queries.clear();
+			for (const [id, runtime] of staged) this.queries.set(id, runtime);
+			installed = true;
+			this.catalog.clear();
+			for (const config of candidate) this.catalog.set(config.id, snapshotValue(config));
+			this.started = true;
+			this.generation++;
+			signal.throwIfAborted();
+			for (const runtime of staged.values()) {
+				await this.hooks.onQueryAdded?.(runtime.query);
+				signal.throwIfAborted();
+				await runtime.start();
+				signal.throwIfAborted();
+				if ([runtime.getReadStatus().status.name, runtime.getQueueStatus().status.name].includes("FAILED")) {
+					throw new Error(`Query ${runtime.query.id} failed during initialization; the instance remains paused`);
+				}
+			}
+			this.recoveryRequired = false;
+			this.maintenanceHeld = false;
+			this.applyGlobalHolds(staged.values());
+		} catch (error) {
+			// Never reactivate work after timeout or partial replacement. Before commit,
+			// the original catalog and queues remain inspectable; after it, restart can retry.
+			// Preserve the existing failure contract: both stages remain globally
+			// paused after a failed replacement, including after a successful retry.
+			this.globalReadPaused = true;
+			this.globalProcessPaused = true;
+			this.maintenanceHeld = this.recoveryRequired;
+			if (!installed) for (const runtime of staged.values()) runtime.discardUnstarted();
+			throw error;
+		}
+	}
+
+	private async runInstanceOperation(name: LifecycleOperation, options: LifecycleOperationOptions,
+		work: (signal: AbortSignal) => Promise<void>, scope?: GlobalPauseScope): Promise<void> {
+		assertOutsideUserCallback(name, this.callbackOwner);
+		this.assertActive();
+		if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 2_147_483_647)) {
+			throw new Error("timeoutMs must be an integer between 1 and 2147483647");
+		}
+		if (this.instanceOperation) throw new LifecycleBusyError(name, -1, this.instanceOperation.name);
+		const activeQuery = this.queryLifecycles.entries().next().value as [number, QueryLifecycleState] | undefined;
+		if (activeQuery) throw new LifecycleBusyError(name, activeQuery[0], activeQuery[1].phase);
+		const operation = { name, startedAt: Date.now(), timedOut: false, ...(scope === undefined ? {} : { scope }) };
+		this.instanceOperation = operation;
+		this.lastLifecycleError = undefined;
+		const controller = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const pending = Promise.resolve().then(() => work(controller.signal)).catch((error) => {
+			this.lastLifecycleError = errorDetails(error).message;
+			throw error;
+		}).finally(() => {
+			if (timer) clearTimeout(timer);
+			if (this.instanceOperation === operation) this.instanceOperation = undefined;
+			if (name === "shutdown") this.shutdownCompletion = undefined;
+		});
+		if (name === "shutdown") this.shutdownCompletion = pending;
+		if (options.timeoutMs === undefined) return pending;
+		const deadline = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => {
+				operation.timedOut = true;
+				const error = new LifecycleTimeoutError(name, options.timeoutMs!);
+				this.lastLifecycleError = error.message;
+				controller.abort(error);
+				reject(error);
+			}, options.timeoutMs);
+		});
+		return Promise.race([pending, deadline]);
 	}
 
 	private async withQueryControl(
@@ -906,6 +1084,7 @@ export class HederaEventSync {
 		let lifecycle: QueryLifecycleState | undefined;
 		await this.withMutationLock(async () => {
 			this.assertActive();
+			if (this.instanceOperation) throw new LifecycleBusyError(phase, queryId, this.instanceOperation.name);
 			this.assertQueryLifecycleIdle(queryId, phase);
 			runtime = this.queries.get(queryId);
 			if (!runtime) return;

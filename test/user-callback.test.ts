@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { HederaRestClient } from "@davincigraph/hedera-rest-client";
 import { toEventSelector } from "viem";
-import { HandlerRegistry, HederaEventSync, LifecycleReentrancyError, LogEventProcessor } from "../src/index";
+import { HandlerRegistry, HederaEventSync, LifecycleReentrancyError, LogEventProcessor, type QueryConfig } from "../src/index";
 import { assertOutsideUserCallback, runInUserCallback, type UserCallbackContext } from "../src/eventSync/utils/userCallback";
 
 const outerContext: UserCallbackContext = { kind: "hook", name: "onReadCycleStarted", queryId: 1 };
@@ -71,7 +71,8 @@ describe("user callback ancestry", () => {
 
 	it("prevents a standalone processor nested in a read hook from deadlocking pauseRead", async () => {
 		const restClient = {} as HederaRestClient;
-		const sync = await HederaEventSync.create({ restClient, singletonGuard: false });
+		let catalog: QueryConfig[] = [];
+		const sync = await HederaEventSync.create({ restClient, singletonGuard: false, querySource: () => catalog });
 		const registry = new HandlerRegistry();
 		const begin = deferred();
 		const completed = deferred();
@@ -107,7 +108,7 @@ describe("user callback ancestry", () => {
 		});
 		let testTimeout: ReturnType<typeof setTimeout> | undefined;
 		try {
-			await sync.addQuery({
+			catalog = [{
 				type: "Transactions", id: 1, title: "callback ancestry",
 				read: {
 					fetch: { network: "testnet", restProvider: "public" },
@@ -115,7 +116,8 @@ describe("user callback ancestry", () => {
 				},
 				params: { accountId: "0.0.123", timestamp: "1" },
 				process: { pauseAfterConsecutiveFailures: 3 },
-			});
+			}];
+			await sync.start();
 			begin.resolve();
 			await Promise.race([
 				completed.promise,

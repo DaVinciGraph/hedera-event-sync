@@ -34,6 +34,69 @@ function transactionQuery(): Extract<RuntimeQueryConfig, { type: "Transactions" 
 }
 
 describe("hook failure isolation", () => {
+	for (const failureMode of ["synchronous", "asynchronous"] as const) {
+		it(`contains ${failureMode} onFailure errors and still reports the original failure`, async () => {
+			const calls: string[] = [];
+			const hooks = new CompositeHooks(
+				[
+					{ onReadInit() { throw new Error("observer failed"); } },
+					{
+						onHookError(failure) {
+							calls.push(`reported:${failure.policy}:${(failure.error as Error).message}`);
+						},
+						onReadInit() { calls.push("next observer"); },
+					},
+				],
+				{
+					policy: "pause",
+					onFailure() {
+						calls.push("control");
+						if (failureMode === "synchronous") throw new Error("control failed");
+						return new Promise<void>((_resolve, reject) => {
+							setImmediate(() => {
+								calls.push("rejected");
+								reject(new Error("control failed"));
+							});
+						});
+					},
+				}
+			);
+
+			await hooks.onReadInit(transactionQuery(), 30);
+			assert.deepEqual(calls, ["control", "reported:pause:observer failed", "next observer"]);
+			// Let a rejection after dispatch reach Node's unhandled-rejection check.
+			// The test runner fails this test if the callback's promise was ignored.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			assert.deepEqual(calls, [
+				"control", "reported:pause:observer failed", "next observer",
+				...(failureMode === "asynchronous" ? ["rejected"] : []),
+			]);
+		});
+	}
+
+	it("does not wait for an onFailure callback that never settles", { timeout: 1000 }, async () => {
+		const calls: string[] = [];
+		const hooks = new CompositeHooks(
+			[
+				{ onReadInit() { throw new Error("observer failed"); } },
+				{
+					onHookError() { calls.push("reported"); },
+					onReadInit() { calls.push("next observer"); },
+				},
+			],
+			{
+				onFailure() {
+					calls.push("control");
+					return new Promise<void>(() => {});
+				},
+			}
+		);
+
+		await hooks.onReadInit(transactionQuery(), 30);
+		assert.deepEqual(calls, ["control", "reported", "next observer"]);
+	});
+
 	for (const policy of ["pause", "fail-fast"] as const) {
 		it(`applies the ${policy} policy before a blocked error observer settles`, async () => {
 			let observerStarted!: () => void;

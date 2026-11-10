@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { LifecycleReentrancyError } from "../errors";
 
 export type UserCallbackContext = {
-	kind: "hook" | "handler" | "normalizer" | "resolver" | "until";
+	kind: "hook" | "handler" | "normalizer" | "resolver" | "filter" | "until" | "querySource" | "checkpoint";
 	name: string;
 	queryId: number | null;
 };
