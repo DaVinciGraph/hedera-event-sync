@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md) · [API reference](reference.md) · [Changelog](../CHANGELOG.md)
 
-Version **2.0.0** is prepared/unreleased as of **2026-11-10**. This checklist prepares and verifies a local npm archive. Publishing, pushing, and tagging are separate release actions and are not part of these steps.
+This checklist covers preparation and verification of the **2.0.0** npm archive. Publishing, pushing, and tagging are separate release actions.
 
 ## Prepare the release
 

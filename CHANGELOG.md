@@ -1,8 +1,8 @@
 # Changelog
 
-## 2.0.0 — prepared / unreleased (2026-11-10)
+## 2.0.0 — 2026-11-10
 
-This unreleased major version supersedes the unpublished 1.1.0 preparation below. See the [migration guide](docs/migration-v2.md), [lifecycle guide](docs/lifecycle.md), and [release checklist](docs/releasing.md).
+This major release supersedes the unpublished 1.1.0 preparation below. See the [migration guide](docs/migration-v2.md), [lifecycle guide](docs/lifecycle.md), and [release checklist](docs/releasing.md).
 
 ### Breaking changes
 
