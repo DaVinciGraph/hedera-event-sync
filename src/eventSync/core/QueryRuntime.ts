@@ -31,9 +31,10 @@ export class QueryRuntime {
 		private readonly rest: RestClient,
 		private readonly registry: HandlerRegistry,
 		private readonly hooks: SyncHooks,
-		private readonly callbackOwner?: object
+		private readonly callbackOwner?: object,
+		failureRecoveryDelayMs?: number
 	) {
-		this.queue = new ProcessQueue(query, registry, this.store, this.hooks, this.rest, callbackOwner, () => this.readJob?.getReplayFloor());
+		this.queue = new ProcessQueue(query, registry, this.store, this.hooks, this.rest, callbackOwner, () => this.readJob?.getReplayFloor(), failureRecoveryDelayMs);
 
 		const commitPage = (items: readonly StagedProcess[], signal: AbortSignal) => this.commitPage(items, signal);
 		const pruneSourceKeysBefore = (timestamp: string) => this.store.pruneSourceKeysBefore(this.query.id, timestamp);
@@ -42,10 +43,10 @@ export class QueryRuntime {
 
 		if (query.type === "Transactions") {
 			const txQuery = query as Extract<RuntimeQueryConfig, { type: "Transactions" }>;
-			this.readJob = new TransactionsReadJob(txQuery, rest, registry, commitPage, pruneSourceKeysBefore, getQueueSize, threshold, this.hooks, callbackOwner);
+			this.readJob = new TransactionsReadJob(txQuery, rest, registry, commitPage, pruneSourceKeysBefore, getQueueSize, threshold, this.hooks, callbackOwner, failureRecoveryDelayMs);
 		} else {
 			const logsQuery = query as Extract<RuntimeQueryConfig, { type: "Multi-Contract-Logs" | "Single-Contract-Logs" }>;
-			this.readJob = new LogsReadJob(logsQuery, rest, registry, commitPage, pruneSourceKeysBefore, getQueueSize, threshold, this.hooks, callbackOwner);
+			this.readJob = new LogsReadJob(logsQuery, rest, registry, commitPage, pruneSourceKeysBefore, getQueueSize, threshold, this.hooks, callbackOwner, failureRecoveryDelayMs);
 		}
 	}
 

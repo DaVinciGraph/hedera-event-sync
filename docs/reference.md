@@ -33,6 +33,7 @@ Pass these to `HederaEventSync.create(options)`:
 | `beforeReplace` | Optional | Awaited persistence boundary with final processed checkpoints before restart/reload/shutdown releases old work; required for durable replacement guarantees |
 | `singletonGuard` | `true` | Reuse the process-local instance; `false` deliberately creates an isolated engine |
 | `hookFailurePolicy` | `"continue"` | `"continue"`, `"pause"`, or `"fail-fast"` |
+| `failureRecovery` | Disabled | `{ enabled: true, delaySeconds?: number }` retries failure-limit pauses independently; interval defaults to 3600 seconds. See [lifecycle behavior and inspection](lifecycle.md#automatic-failure-recovery). |
 | `defaults` | Optional | Fallback values listed below |
 
 Set defaults **inside** `defaults`. Query-level values take precedence.
@@ -46,6 +47,11 @@ Set defaults **inside** `defaults`. Query-level values take precedence.
 | `defaults.finalityLagSeconds` | `read.consistency.finalityLagSeconds` | `15` seconds behind the local clock |
 | `defaults.overlapSeconds` | `read.consistency.overlapSeconds` | `30` seconds of replay history |
 | `defaults.debugRestClient` | None | `false`; enables REST-facade request diagnostics |
+
+`sync.holdFailureRecovery()` acquires an application recovery hold and returns an
+idempotent release function. Use `try/finally` around application-owned management
+work that precedes a package lifecycle call. It defers automatic retries only;
+see [automatic failure recovery](lifecycle.md#automatic-failure-recovery).
 
 ### Shared query options
 

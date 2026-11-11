@@ -30,9 +30,10 @@ export class LogsReadJob extends ReadJob {
 		readonly getQueueSize: () => number,
 		readonly backpressureThreshold: number = DEFAULTS.maxQueuedProcessesPerQuery,
 		readonly hooks: SyncHooks,
-		callbackOwner?: object
+		callbackOwner?: object,
+		failureRecoveryDelayMs?: number
 	) {
-		super(query, getQueueSize, backpressureThreshold, hooks, callbackOwner);
+		super(query, getQueueSize, backpressureThreshold, hooks, callbackOwner, failureRecoveryDelayMs);
 		this.queryTyped = query;
 	}
 

@@ -10,7 +10,12 @@ export type QueryQueueAndJobStatus = "PAUSED" | "RUNNING" | "PAUSING" | "RESUMIN
 /** Supported Mirror Node source shapes. */
 export type QueryKind = "Multi-Contract-Logs" | "Single-Contract-Logs" | "Transactions";
 /** Current lifecycle state and an optional operator-facing reason. */
-export type QueryStatus = { name: QueryQueueAndJobStatus; info?: string };
+export type QueryStatus = {
+	name: QueryQueueAndJobStatus;
+	info?: string;
+	/** Earliest automatic retry, in epoch milliseconds. Lifecycle holds may defer it. */
+	failureRecovery?: { retryAt: number };
+};
 
 /** Independent states applied only when a query ID first joins the catalog. */
 export type QueryStartState = {

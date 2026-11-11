@@ -90,6 +90,13 @@ export type BeforeReplaceContext = Readonly<{
 	checkpoints: readonly Readonly<{ query: RuntimeQueryConfig; checkpoint: Readonly<ProcessedCheckpoint> }>[];
 }>;
 
+/** Opt-in retry of failure-limit pauses; intentional and terminal pauses are excluded. */
+export type FailureRecoveryOptions = {
+	enabled: boolean;
+	/** Positive whole seconds, up to 2147483647. Defaults to one hour. */
+	delaySeconds?: number;
+};
+
 /** Construction options for the synchronization engine. */
 export type HederaEventSyncOptions = {
 	/** Configured REST client used by every query runtime in this instance. */
@@ -107,6 +114,8 @@ export type HederaEventSyncOptions = {
 	singletonGuard?: boolean;
 	/** Controls runtime behavior after a hook rejects. Defaults to "continue". */
 	hookFailurePolicy?: HookFailurePolicy;
+	/** Disabled unless explicitly enabled. Reading and processing retry independently. */
+	failureRecovery?: FailureRecoveryOptions;
 	/** Query defaults used when the corresponding query-level value is absent. */
 	defaults?: {
 		/** Base delay between completed read cycles; runtime jitter is applied. Defaults to 30 seconds. */
@@ -164,6 +173,9 @@ export class HederaEventSync {
 	private readonly catalog = new Map<number, RuntimeQueryConfig>();
 	private readonly querySource: QuerySource;
 	private readonly beforeReplace?: HederaEventSyncOptions["beforeReplace"];
+	private readonly failureRecoveryDelayMs?: number;
+	private failureRecoveryTimer?: ReturnType<typeof setTimeout>;
+	private failureRecoveryHolds = 0;
 
 
 	private readonly _registry = new HandlerRegistry();
@@ -180,6 +192,17 @@ export class HederaEventSync {
 	private constructor(opts: HederaEventSyncOptions) {
 		this.querySource = opts.querySource;
 		this.beforeReplace = opts.beforeReplace;
+		const recovery = opts.failureRecovery;
+		if (recovery !== undefined) {
+			if (!recovery || typeof recovery !== "object" || Array.isArray(recovery) || typeof recovery.enabled !== "boolean") {
+				throw new Error("failureRecovery must have a boolean enabled property");
+			}
+			const delay = recovery.delaySeconds === undefined ? 3600 : recovery.delaySeconds;
+			if (!Number.isSafeInteger(delay) || delay < 1 || delay > 2_147_483_647) {
+				throw new Error("failureRecovery.delaySeconds must be an integer between 1 and 2147483647");
+			}
+			if (recovery.enabled) this.failureRecoveryDelayMs = delay * 1000;
+		}
 		this.hooks = new CompositeHooks([new HookBase()], {
 			policy: opts.hookFailurePolicy,
 			onFailure: (failure) => this.handleHookFailure(failure),
@@ -283,6 +306,22 @@ export class HederaEventSync {
 			globalPaused: globalReadPaused && globalProcessPaused, globalReadPaused, globalProcessPaused, maintenanceHeld: this.maintenanceHeld,
 			...(this.instanceOperation ? { operation: Object.freeze({ ...this.instanceOperation }) } : {}),
 			...(this.lastLifecycleError ? { lastError: this.lastLifecycleError } : {}) });
+	}
+
+	/**
+	 * Defer automatic retries while application-owned management work settles.
+	 * This does not pause active work or block explicit lifecycle controls. Call
+	 * the idempotent release function in finally; overlapping holds compose.
+	 */
+	holdFailureRecovery(): () => void {
+		this.assertActive();
+		this.failureRecoveryHolds++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.failureRecoveryHolds--;
+		};
 	}
 
 	/** Validates and normalizes without registering a runtime, calling hooks, or making network requests. */
@@ -994,7 +1033,7 @@ export class HederaEventSync {
 				const resolved = snapshotValue(config);
 				const old = this.queries.get(config.id);
 				if (old) Object.assign(resolved.params, old.getProcessedCheckpoint());
-				const runtime = new QueryRuntime(resolved, this.rest, this._registry, this.hooks, this.callbackOwner);
+				const runtime = new QueryRuntime(resolved, this.rest, this._registry, this.hooks, this.callbackOwner, this.failureRecoveryDelayMs);
 				runtime.setLifecycleHold(true);
 				if (old) runtime.restoreControlState(old.getControlState());
 				staged.set(config.id, runtime);
@@ -1050,6 +1089,8 @@ export class HederaEventSync {
 		if (activeQuery) throw new LifecycleBusyError(name, activeQuery[0], activeQuery[1].phase);
 		const operation = { name, startedAt: Date.now(), timedOut: false, ...(scope === undefined ? {} : { scope }) };
 		this.instanceOperation = operation;
+		if (this.failureRecoveryTimer) clearTimeout(this.failureRecoveryTimer);
+		this.failureRecoveryTimer = undefined;
 		this.lastLifecycleError = undefined;
 		const controller = new AbortController();
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1060,6 +1101,7 @@ export class HederaEventSync {
 			if (timer) clearTimeout(timer);
 			if (this.instanceOperation === operation) this.instanceOperation = undefined;
 			if (name === "shutdown") this.shutdownCompletion = undefined;
+			this.scheduleFailureRecovery();
 		});
 		if (name === "shutdown") this.shutdownCompletion = pending;
 		if (options.timeoutMs === undefined) return pending;
@@ -1073,6 +1115,39 @@ export class HederaEventSync {
 			}, options.timeoutMs);
 		});
 		return Promise.race([pending, deadline]);
+	}
+
+	/** One instance timer; runtime identity and eligibility are rechecked under the control gate. */
+	private scheduleFailureRecovery(): void {
+		if (this.failureRecoveryDelayMs === undefined || !this.started || this.closed || this.failureRecoveryTimer || this.instanceOperation) return;
+		this.failureRecoveryTimer = setTimeout(() => {
+			this.failureRecoveryTimer = undefined;
+			void this.recoverFailurePauses().finally(() => this.scheduleFailureRecovery());
+		}, 1000);
+		this.failureRecoveryTimer.unref();
+	}
+
+	private async recoverFailurePauses(): Promise<void> {
+		if (this.failureRecoveryHolds > 0) return;
+		for (const [id, expected] of this.queries) {
+			for (const kind of ["read", "process"] as const) {
+				const eligible = (runtime: QueryRuntime) => {
+					if (this.closed || this.instanceOperation || this.maintenanceHeld || this.recoveryRequired || this.failureRecoveryHolds > 0 || runtime !== expected) return false;
+					if (kind === "read" ? this.globalReadPaused : this.globalProcessPaused) return false;
+					const status = kind === "read" ? runtime.getReadStatus().status : runtime.getQueueStatus().status;
+					return status.name === "PAUSED" && status.failureRecovery !== undefined && status.failureRecovery.retryAt <= Date.now();
+				};
+				if (!eligible(expected) || this.queryLifecycles.has(id)) continue;
+				try {
+					await this.withQueryControl(id, kind === "read" ? "resumeRead" : "resumeProcessing", async runtime => {
+						if (!eligible(runtime)) return;
+						if (kind === "read") await runtime.resumeRead(); else await runtime.resumeProcessing();
+					});
+				} catch (error) {
+					if (!(error instanceof LifecycleBusyError)) this.lastLifecycleError = `Automatic failure recovery: ${errorDetails(error).message}`;
+				}
+			}
+		}
 	}
 
 	private async withQueryControl(

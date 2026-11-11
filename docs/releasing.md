@@ -2,11 +2,11 @@
 
 [Back to the README](../README.md) · [API reference](reference.md) · [Changelog](../CHANGELOG.md)
 
-This checklist covers preparation and verification of the **2.0.0** npm archive. Publishing, pushing, and tagging are separate release actions.
+This checklist covers preparation and verification of the **2.1.0** npm archive. Publishing, pushing, and tagging are separate release actions.
 
 ## Prepare the release
 
-- Confirm `package.json` and the root package metadata in `package-lock.json` agree on `2.0.0`.
+- Confirm `package.json` and the root package metadata in `package-lock.json` agree on `2.1.0`.
 - Review the [changelog](../CHANGELOG.md), public declarations, and [query-list filtering contract](reference.md#query-list-filtering). Verify omitted/`undefined` filters, exact contract types and unspecified (`null`) types, single and readonly-array statuses (including empty arrays), trimmed case-insensitive literal search over every supported field, and invalid operational-filter inputs. Combine these with network/query kind in all order modes; check filtered counts, empty results, and page reclamping.
 - Verify query-list status matching agrees with returned effective statuses during read-only, processing-only, and both-side global holds, including active work settling through `PAUSING`. Preserve independently paused/failed sides; failure-threshold pauses must match `PAUSED`, not `FAILED`. Confirm filtering performs no loader or Mirror Node calls and leaves synchronization behavior unchanged.
 - Preserve the optional pre-decode `params.logFilter` behavior and its tests: `false` ignores a log, `true` continues strict decoding, and a thrown error retries the page.
@@ -20,6 +20,8 @@ This checklist covers preparation and verification of the **2.0.0** npm archive.
 - Verify side-effect-free `validateQuery`, new-query `initialState` without transient reads/handlers, pause/failure counter preservation, and final checkpoint persistence. Include query-edit lifecycle, coordinator, and built consumer declaration tests.
 - Keep the original coverage gates; do not lower thresholds for the new coordination paths.
 - Review the working diff and ensure the npm `files` allowlist includes `dist`, `docs`, `README.md`, `CHANGELOG.md`, and `LICENSE`.
+
+- Verify opt-in automatic failure recovery: one-hour default, independent stages, repeated failure budgets, intact FIFO and checkpoints, manual takeover during active work, global/maintenance deferral, retained deadlines on replacement, removal, shutdown, and no recovery of hook-policy or terminal failures. Confirm status snapshots detach `failureRecovery.retryAt` and public declarations export `FailureRecoveryOptions`.
 
 ## Run the package gates
 
@@ -44,7 +46,7 @@ After a successful `prepack`, use a temporary directory for the archive. `--igno
 
 ```powershell
 $repoDir = (Get-Location).Path
-$releaseDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hedera-event-sync-2.0.0-" + [guid]::NewGuid().ToString("N"))
+$releaseDir = Join-Path ([System.IO.Path]::GetTempPath()) ("hedera-event-sync-2.1.0-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $releaseDir | Out-Null
 $packJson = npm pack --ignore-scripts --json --pack-destination $releaseDir
 if ($LASTEXITCODE -ne 0) { throw "npm pack failed" }
@@ -57,7 +59,7 @@ tar -tzf $tarball
 tar -xOf $tarball package/package.json
 ```
 
-Verify the archive identifies `@davincigraph/hedera-event-sync@2.0.0`, includes each documented export and its `.d.ts` file under `dist`, and contains the README, license, changelog, and documentation. Inspect the archive's declarations for the required `querySource`, lifecycle types (including `GlobalPauseScope`, `GlobalPauseOptions`, effective per-side holds, and optional operation scope), `beforeReplace`, and `initialState`, plus the `readStatus`, `processStatus`, and `search` query-list options, optional transaction `params.transactionType`, and retained `contractType` and `logFilter` APIs. Confirm removed mutation methods are absent. Review the complete file list for unintended credentials, local configuration, temporary artifacts, or unrelated files. Keep the archive and the `pack.json` integrity metadata with the local validation results.
+Verify the archive identifies `@davincigraph/hedera-event-sync@2.1.0`, includes each documented export and its `.d.ts` file under `dist`, and contains the README, license, changelog, and documentation. Inspect the archive's declarations for the required `querySource`, lifecycle types (including `GlobalPauseScope`, `GlobalPauseOptions`, effective per-side holds, and optional operation scope), `beforeReplace`, and `initialState`, plus the `readStatus`, `processStatus`, and `search` query-list options, optional transaction `params.transactionType`, and retained `contractType` and `logFilter` APIs. Confirm removed mutation methods are absent. Review the complete file list for unintended credentials, local configuration, temporary artifacts, or unrelated files. Keep the archive and the `pack.json` integrity metadata with the local validation results.
 
 ## Smoke-test an installed archive
 
@@ -90,3 +92,18 @@ try {
 This checks both the current Node runtime and the supported Node 18 line, with the minimum documented TypeScript minor version (5.4). The extra Node runtime may need to be downloaded from npm; it does not replace the system installation.
 
 Confirm the installed runtime fixture exercises construction without auto-start, explicit start, scoped and default global pause/resume, effective lifecycle fields, restart without loading, reload, shutdown, removed API absence, and operational query-list filters/search. The declaration fixture must accept every global scope and reject invalid scopes, expose the new lifecycle fields and optional operation scope, require a complete loader, type its context/persistence boundary and new-query state, reject the removed mutation methods, accept status names/readonly arrays/search/explicit `undefined`, reject invalid filter types, and preserve existing filter contracts with `exactOptionalPropertyTypes`. Record the tarball path, checksum/integrity, gate results, and installed-consumer results. Keep the changelog marked unreleased during preparation; update its status and date when finalizing the release, then pack and inspect the final archive again.
+
+## Publish with GitHub Desktop and npm
+
+Use this order after the checks above pass. Version 2.1.0 is already set in both manifests; do not increment it again.
+
+1. In GitHub Desktop, select this repository and the `main` branch. Commit the complete reviewed release, including the new recovery tests and [release notes](releases/v2.1.0.md). Suggested summary: `feat: add automatic failure recovery in v2.1.0`.
+2. In **History**, right-click that release commit, choose **Create Tag**, and enter `v2.1.0`. Click **Push origin** to push the commit and tag. Confirm both are visible on GitHub before publishing to npm.
+3. From this repository's root, run `npm whoami --registry=https://registry.npmjs.org/`. If authentication is needed, run `npm login --registry=https://registry.npmjs.org/` and follow its prompts using an account with publish access to the package.
+4. Confirm the working tree is clean with `git status --short`. Publish the committed source with `npm publish --access public --tag latest --registry=https://registry.npmjs.org/`. The package's `prepack` script reruns type checks, tests, coverage, build, and export checks. Complete npm's authentication/2FA prompts. Stop if a check or publication fails.
+5. Verify publication with `npm view @davincigraph/hedera-event-sync@2.1.0 version --registry=https://registry.npmjs.org/` and `npm view @davincigraph/hedera-event-sync dist-tags --json --registry=https://registry.npmjs.org/`. The version and `latest` should both be `2.1.0`.
+6. On GitHub, open **Releases**, then **Draft a new release**. Select the existing `v2.1.0` tag, use `v2.1.0 — Automatic failure recovery` as the title, and paste [the prepared release notes](releases/v2.1.0.md). Publish it as the latest stable release after npm verification succeeds. No additional binary attachments are required for this package.
+
+An npm version cannot be overwritten. If a publish command has an uncertain outcome, check whether `2.1.0` exists before attempting it again. A GitHub release is separate from npm publication; publishing one does not automatically publish the other.
+
+Official instructions: [GitHub Desktop tags](https://docs.github.com/en/desktop/managing-commits/managing-tags-in-github-desktop), [GitHub releases](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository), and [npm public scoped packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/).

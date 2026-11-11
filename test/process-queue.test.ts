@@ -842,7 +842,9 @@ describe("ProcessQueue attempts", () => {
 			await queue.flushHooks();
 			assert.equal(queue.getStatus().name, "PAUSED");
 			assert.equal(queue.getInFlight(), undefined);
-			assert.deepEqual(observedStatuses, ["PAUSING", "PAUSED"]);
+			assert.equal(queue.getStatus().info, "operator");
+			// Taking over the pause publishes its changed ownership before settlement.
+			assert.deepEqual(observedStatuses, ["PAUSING", "PAUSING", "PAUSED"]);
 		} finally {
 			if (!hookReleased) releaseFailureHook();
 			queue.stop();

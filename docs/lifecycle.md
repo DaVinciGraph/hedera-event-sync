@@ -54,6 +54,32 @@ Do not persist global holds as manual per-query pauses. `resumeAll` changes admi
 
 Paginated `listQueries()` can filter these effective states independently with `readStatus` and `processStatus`, alongside configured-title/identifier `search`. The filters inspect the loaded catalog without invoking the loader or changing holds. See [query-list filtering](reference.md#query-list-filtering).
 
+## Automatic failure recovery
+
+Automatic recovery is disabled by default. Opt in at construction:
+
+```ts
+const sync = await HederaEventSync.create({
+  restClient,
+  querySource,
+  failureRecovery: { enabled: true, delaySeconds: 3600 },
+});
+```
+
+`FailureRecoveryOptions` is a public export. `enabled` is a boolean; omitting the entire option or setting it to `false` keeps failure pauses under operator control. `delaySeconds` defaults to 3600 and must be a whole number from 1 to 2,147,483,647. Configuration is per instance; read and processing stages use independent deadlines. There is no environment, database, Redis, or notification dependency.
+
+- Only a pause raised internally by reaching `pauseAfterConsecutiveFailures` qualifies. Initial pauses, manual pauses, fulfilled predicates, backpressure, hook-policy pauses, and terminal `FAILED`/`STOPPED` states are excluded. Existing capacity-based resumption is unchanged.
+- `query.read.status.failureRecovery?.retryAt` and `query.process.status.failureRecovery?.retryAt` expose the earliest retry time in epoch milliseconds. The field is also available in stage status inspection and status-change hooks. It disappears on resumption or an intentional takeover of the pause. Do not infer eligibility from the human-readable `info` string.
+- A single unreferenced instance timer checks due work roughly once per second. A retry waits for the stage to finish pausing, then uses the ordinary resume path and resets that stage's consecutive-failure budget. It does not clear queued records, change cursors, skip the failing item, or reload configuration. Continued failure reaches the limit again and schedules a new cooldown.
+- Global stage holds, maintenance, and active instance operations defer recovery without discarding the deadline. Per-query controls take precedence under the same lifecycle gate. A due retry becomes eligible after the applicable hold or operation ends; the displayed deadline is not a promise of exact execution time.
+- Applications can call `const release = sync.holdFailureRecovery()` before their own catalog writes or management work, then call `release()` in `finally`. This synchronous hold prevents admission of automatic retries across the storage-before-reload interval; it does not pause ordinary work or block explicit controls. Holds compose, release is idempotent, and deadlines remain intact. A forgotten release intentionally keeps automatic recovery held.
+- Calling `pauseRead(id)` or `pauseProcessing(id)` on a failure-paused stage converts it into an intentional pause and cancels recovery. `{ preserveExistingPause: true }` explicitly retains the previous ownership and deadline. Ordinary per-stage resume is available before the cooldown expires.
+- Restart and reload carry the original deadlines and pause ownership for retained logical query IDs. Removed queries are retired; reintroducing an ID later does not inherit its old schedule. Shutdown clears the timer and stops admitting recovery work. Replacement failures keep their existing global/maintenance holds.
+
+Automatic resumption is an attempt, not proof of recovery. Applications should resolve failure incidents on successful reads or processing, and retain their own notification deduplication/rate limits. An unbounded callback cannot be forcibly recovered; it must settle before its stage can retry.
+
+Deadlines are in-memory state. A new Node.js process loads the application's catalog and durable checkpoints, following `initialState` as usual; it does not restore a previous process's cooldown. Applications needing durable pause policy must supply that policy in their source. Keep the process clock synchronized because deadlines use wall-clock epoch time.
+
 ## Static catalog
 
 ```ts

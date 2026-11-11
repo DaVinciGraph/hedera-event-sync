@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.1.0 — 2026-11-11
+
+### Added
+
+- Optional engine `failureRecovery: { enabled, delaySeconds? }`. Recovery is disabled by default; explicit enablement uses a one-hour cooldown unless overridden. Reading and processing retry independently through the existing resume paths, retaining their queues, cursors, ordering, and fresh failure budgets.
+- Failure-paused statuses expose `failureRecovery.retryAt` in epoch milliseconds. Global holds, maintenance, and active lifecycle operations defer recovery. Retained query IDs preserve their original deadlines across restart/reload; removed queries and stopped instances cannot trigger stale retries. No external persistence or service is required.
+- `holdFailureRecovery()` supplies a composable, explicitly released hold for application management work before a reload, without pausing ordinary work or blocking explicit controls.
+
+### Fixed
+
+- Explicit manual and hook pauses supersede failure recovery, including when a handler fails while an operator pause is settling. A changed pause reason is published even if the stage remains paused or pausing. `preserveExistingPause: true` deliberately preserves existing failure ownership and its deadline.
+
+Cold process startup still uses the application's source and durable checkpoints. Automatic retry deadlines are in-memory lifecycle state, not persisted across process exit. See [automatic failure recovery](docs/lifecycle.md#automatic-failure-recovery).
+
 ## 2.0.0 — 2026-11-10
 
 This major release supersedes the unpublished 1.1.0 preparation below. See the [migration guide](docs/migration-v2.md), [lifecycle guide](docs/lifecycle.md), and [release checklist](docs/releasing.md).

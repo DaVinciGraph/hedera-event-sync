@@ -17,6 +17,7 @@ Typical uses include:
 - Watching transactions involving an account or contract.
 - Showing administrators what is being read, queued, processed, or retried.
 - Sending operational alerts when reading or processing needs attention.
+- Optionally retrying failure-limit pauses after a configurable cooldown while respecting intentional stops. See [automatic failure recovery](docs/lifecycle.md#automatic-failure-recovery).
 
 It is a Node.js library that runs **inside your application**, not a hosted service or a separate worker you must deploy. It has no required database, email service, UI framework, or DaVinciGraph application.
 

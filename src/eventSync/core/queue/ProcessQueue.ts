@@ -10,7 +10,7 @@ import { LogEventProcessor } from "../logs/LogEventProcessor";
 import type { LogHandler, ProcessHandler, TransactionHandler } from "../../handlers/types";
 import { ProcessStore } from "./ProcessStore";
 import { nextRetentionDelay } from "../../utils/retention";
-import { snapshotProcess, snapshotProcessStep, snapshotProcessTry, snapshotQuery } from "../../utils/snapshot";
+import { snapshotProcess, snapshotProcessStep, snapshotProcessTry, snapshotQuery, snapshotValue } from "../../utils/snapshot";
 import type { SyncContractLog, SyncTransaction } from "../../types/mirror";
 import { maxCursor } from "../../utils/comparators";
 import {
@@ -72,7 +72,8 @@ export class ProcessQueue {
 		private readonly hooks: SyncHooks,
 		private readonly rest: RestClient,
 		private readonly callbackOwner?: object,
-		private readonly getReplayFloor?: () => string | undefined
+		private readonly getReplayFloor?: () => string | undefined,
+		private readonly failureRecoveryDelayMs?: number
 	) {
 		this.status = { ...query.process.status };
 		this.lastNotifiedStatus = this.status.name;
@@ -181,7 +182,7 @@ export class ProcessQueue {
 	getStatus(): QueryStatus {
 		return this.lifecycleHeld && this.status.name === "RUNNING"
 			? { name: this.inFlight ? "PAUSING" : "PAUSED", info: "Processing is paused for the synchronization instance" }
-			: { ...this.status };
+			: snapshotValue(this.status);
 	}
 
 	setLifecycleHold(held: boolean): void { this.lifecycleHeld = held; }
@@ -198,11 +199,12 @@ export class ProcessQueue {
 			const process = this.store.get(id);
 			if (process) failures.set(process.sourceKey, count);
 		}
-		return { status: { ...this.status }, failures };
+		return { status: snapshotValue(this.status), failures };
 	}
 
 	restoreControlState(state: ReturnType<ProcessQueue["getControlState"]>): void {
-		this.status = { ...state.status };
+		this.status = snapshotValue(state.status);
+		this.pauseReason = this.status.info;
 		this.query.process.status = this.status;
 		this.lastNotifiedStatus = this.status.name;
 		this.restoredFailures = new Map(state.failures);
@@ -424,9 +426,7 @@ export class ProcessQueue {
 			if (now >= this.query.process.pauseAfterConsecutiveFailures) {
 				proc.status = "Failed";
 				this.store.set(proc);
-				this.pauseReason = `Processing Queue is paused due to ${this.query.process.pauseAfterConsecutiveFailures} consecutive failures`;
-				this.setStatus("PAUSING", this.pauseReason);
-				await this.hooks.onProcessConsecutiveFailuresReached?.(this.query, proc, now);
+				if (this.pauseForFailures()) await this.hooks.onProcessConsecutiveFailuresReached?.(this.query, proc, now);
 				this.q.unshift(proc);
 			} else {
 				// Reset status so the retried item doesn't remain marked as Processing if the queue pauses
@@ -484,8 +484,7 @@ export class ProcessQueue {
 			this.consecutiveFailuresFor.set(proc.id, failures);
 			if (failures >= this.query.process.pauseAfterConsecutiveFailures) {
 				proc.status = "Failed";
-				this.pauseReason = `Processing Queue is paused due to ${this.query.process.pauseAfterConsecutiveFailures} consecutive failures`;
-				this.setStatus("PAUSING", this.pauseReason);
+				this.pauseForFailures();
 			} else {
 				proc.status = "Queued";
 			}
@@ -509,12 +508,9 @@ export class ProcessQueue {
 
 	async pause(reason?: string, preserveExistingPause = false): Promise<void> {
 		this.assertControllable("pause");
-		if (!preserveExistingPause || (this.status.name !== "PAUSED" && this.status.name !== "PAUSING")) this.pauseReason = reason ?? "admin";
-
-		if (this.status.name === "RUNNING") {
-			this.setStatus("PAUSING", this.pauseReason);
-		} else if (this.status.name !== "PAUSED" && this.status.name !== "PAUSING") {
-			this.setStatus("PAUSED", this.pauseReason);
+		if (!preserveExistingPause || (this.status.name !== "PAUSED" && this.status.name !== "PAUSING")) {
+			this.pauseReason = reason ?? "admin";
+			this.setStatus(this.status.name === "RUNNING" || this.status.name === "PAUSING" ? "PAUSING" : "PAUSED", this.pauseReason);
 		}
 
 		await this.settleStatusTransitions();
@@ -549,9 +545,16 @@ export class ProcessQueue {
 	requestHookPause(failure: { hook: string }): void {
 		if (this.status.name === "FAILED" || this.status.name === "STOPPED") return;
 		this.pauseReason = `Processing queue paused because ${failure.hook} failed`;
-		if (this.status.name !== "PAUSED" && this.status.name !== "PAUSING") {
-			this.setStatus("PAUSING", this.pauseReason, false);
-		}
+		this.setStatus(this.status.name === "PAUSED" ? "PAUSED" : "PAUSING", this.pauseReason, false);
+	}
+
+	private pauseForFailures(): boolean {
+		// A manual or hook pause requested during the active handler takes precedence.
+		if (this.status.name !== "RUNNING") return false;
+		this.pauseReason = `Processing Queue is paused due to ${this.query.process.pauseAfterConsecutiveFailures} consecutive failures`;
+		this.setStatus("PAUSING", this.pauseReason, true,
+			this.failureRecoveryDelayMs === undefined ? undefined : { retryAt: Date.now() + this.failureRecoveryDelayMs });
+		return true;
 	}
 
 	private isLogsQuery(): boolean {
@@ -589,7 +592,7 @@ export class ProcessQueue {
 	private async settleStatusTransitions(): Promise<void> {
 		if (this.status.name === "FAILED" || this.status.name === "STOPPED") return;
 		if (this.status.name === "PAUSING" && !this.inFlight) {
-			this.setStatus("PAUSED", this.pauseReason);
+			this.setStatus("PAUSED", this.pauseReason, true, this.status.failureRecovery);
 		} else if (this.status.name === "RESUMING") {
 			this.consecutiveFailuresFor.clear();
 			this.restoredFailures.clear();
@@ -605,10 +608,10 @@ export class ProcessQueue {
 		}
 	}
 
-	private setStatus(name: QueryQueueAndJobStatus, info?: string, notify = true): void {
+	private setStatus(name: QueryQueueAndJobStatus, info?: string, notify = true, failureRecovery?: QueryStatus["failureRecovery"]): void {
 		if ((this.status.name === "FAILED" || this.status.name === "STOPPED") && name !== "FAILED" && name !== "STOPPED") return;
-		if (this.status.name === name && this.status.info === info) return;
-		this.status = { name, info: name === "RUNNING" ? undefined : info };
+		if (this.status.name === name && this.status.info === info && this.status.failureRecovery?.retryAt === failureRecovery?.retryAt) return;
+		this.status = { name, info: name === "RUNNING" ? undefined : info, ...(failureRecovery ? { failureRecovery: { ...failureRecovery } } : {}) };
 		this.query.process.status = this.status;
 		if (notify) this.enqueueStatusHook(this.status);
 	}
@@ -634,7 +637,7 @@ export class ProcessQueue {
 
 	private enqueueStatusHook(status: QueryStatus): void {
 		const query = snapshotQuery(this.query);
-		const statusSnapshot = { ...status };
+		const statusSnapshot = snapshotValue(status);
 		this.statusHookChain = this.statusHookChain
 			.then(async () => this.hooks.onQueryStatusChange?.(query, { kind: "process", status: statusSnapshot }))
 			.catch(() => {});

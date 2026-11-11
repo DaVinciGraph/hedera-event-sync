@@ -1,6 +1,6 @@
 {
 	"name": "@davincigraph/hedera-event-sync",
-	"version": "2.0.0",
+	"version": "2.1.0",
 	"private": false,
 	"description": "A type-safe, provider-agnostic Hedera Mirror Node event and transaction synchronization engine.",
 	"license": "MIT",

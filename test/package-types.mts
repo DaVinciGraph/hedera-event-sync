@@ -1,6 +1,16 @@
 import type { ContractLogTopicsFilter, QueryConfig, ListQueriesOptions, Page, RuntimeQueryConfig, GlobalPauseScope, GlobalPauseOptions, LifecycleState, TransactionsParams, TransactionTypes, SyncHooks } from "@davincigraph/hedera-event-sync";
 import { HederaEventSync, ArgsLogHandler, HandlerRegistry, registerLogs, type LogHandler, type LogHandlerContext } from "@davincigraph/hedera-event-sync";
 import type { ContractLogTopicsFilter as SubpathTopicsFilter, TransactionsParams as SubpathTransactionsParams, TransactionTypes as SubpathTransactionTypes } from "@davincigraph/hedera-event-sync/types/config";
+import type { FailureRecoveryOptions, HederaEventSyncOptions, QueryStatus } from "@davincigraph/hedera-event-sync";
+
+const recoveryPolicies: FailureRecoveryOptions[] = [{ enabled: false }, { enabled: true }, { enabled: true, delaySeconds: 3600 }];
+const recoveryStatus: QueryStatus = { name: "PAUSED", failureRecovery: { retryAt: Date.now() + 3600000 } };
+function configureRecovery(options: HederaEventSyncOptions) {
+	for (const failureRecovery of recoveryPolicies) void HederaEventSync.create({ ...options, failureRecovery });
+}
+// @ts-expect-error Enabling automatic recovery requires an explicit boolean.
+const invalidRecovery: FailureRecoveryOptions = { enabled: "true" };
+void configureRecovery; void recoveryStatus; void invalidRecovery;
 
 const knownTransactionType: TransactionTypes = "CONTRACTCALL";
 const futureTransactionType: SubpathTransactionTypes = "FutureForkTransaction";
@@ -72,6 +82,8 @@ function inspectContractQueries(sync: HederaEventSync) {
 void inspectContractQueries;
 
 function configureWithoutStarting(sync: HederaEventSync, input: QueryConfig) {
+	const releaseRecovery: () => void = sync.holdFailureRecovery();
+	releaseRecovery();
 	const normalized: RuntimeQueryConfig = sync.validateQuery(input);
 	void normalized;
 	void sync.start({ timeoutMs: 5_000 });

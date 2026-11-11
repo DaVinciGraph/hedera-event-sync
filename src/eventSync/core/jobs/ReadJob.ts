@@ -7,7 +7,7 @@ import { sleep, sleepWithSignal } from "../../utils/timer";
 import { SyncHooks } from "../../hooks/SyncHooks";
 import { compareHederaTimestamps, currentHederaTimestamp, normalizeHederaTimestamp, subtractHederaTimestampSeconds } from "../../utils/timestamp";
 import { compareCursor } from "../../utils/comparators";
-import { snapshotQuery, snapshotReadCycle } from "../../utils/snapshot";
+import { snapshotQuery, snapshotReadCycle, snapshotValue } from "../../utils/snapshot";
 import { runInUserCallback } from "../../utils/userCallback";
 import { serializeError } from "../../utils/error";
 
@@ -37,7 +37,8 @@ export abstract class ReadJob {
 		protected readonly getQueueSize: () => number = () => 0,
 		protected readonly backpressureThreshold: number = DEFAULTS.maxQueuedProcessesPerQuery,
 		protected readonly hooks: SyncHooks,
-		protected readonly callbackOwner?: object
+		protected readonly callbackOwner?: object,
+		private readonly failureRecoveryDelayMs?: number
 	) {
 		const ts = query.params.timestamp ?? "0";
 		const idx = "index" in query.params ? query.params.index ?? 0 : 0;
@@ -65,9 +66,7 @@ export abstract class ReadJob {
 		if (this.status.name === "FAILED" || this.status.name === "STOPPED") return;
 		this.pausedByBackpressure = false;
 		this.pauseReason = `Read job paused because ${failure.hook} failed`;
-		if (this.status.name !== "PAUSED" && this.status.name !== "PAUSING") {
-			this.setStatus("PAUSING", this.pauseReason, false);
-		}
+		this.setStatus(this.status.name === "PAUSED" ? "PAUSED" : "PAUSING", this.pauseReason, false);
 		this.cancelInFlightCycle();
 	}
 
@@ -211,7 +210,7 @@ export abstract class ReadJob {
 	getStatus(): QueryStatus {
 		return this.lifecycleHeld && this.status.name === "RUNNING"
 			? { name: this.cycleRunning ? "PAUSING" : "PAUSED", info: "Reading is paused for the synchronization instance" }
-			: { ...this.status };
+			: snapshotValue(this.status);
 	}
 
 	/** Independent gate: never changes manual, failure, predicate, or backpressure ownership. */
@@ -228,12 +227,13 @@ export abstract class ReadJob {
 	}
 
 	getControlState() {
-		return { status: { ...this.status }, consecutiveFailures: this.consecutiveFailures,
+		return { status: snapshotValue(this.status), consecutiveFailures: this.consecutiveFailures,
 			lastFailureSource: this.lastFailureSource, pausedByBackpressure: this.pausedByBackpressure };
 	}
 
 	restoreControlState(state: ReturnType<ReadJob["getControlState"]>): void {
-		this.status = { ...state.status };
+		this.status = snapshotValue(state.status);
+		this.pauseReason = this.status.info;
 		this.query.read.status = this.status;
 		this.lastNotifiedStatus = this.status.name;
 		this.consecutiveFailures = state.consecutiveFailures;
@@ -295,15 +295,13 @@ export abstract class ReadJob {
 	}
 
 	/** Internal loop transition: request a pause without waiting on the active cycle. */
-	private requestPause(reason: string): void {
+	private requestPause(reason: string, failureRecovery?: QueryStatus["failureRecovery"]): void {
 		if (this.status.name === "FAILED" || this.status.name === "STOPPED") return;
 		this.pauseReason = reason;
 		if (this.status.name === "RUNNING") {
-			this.setStatus("PAUSING", this.pauseReason);
-		} else if (this.status.name === "PAUSED") {
-			this.setStatus("PAUSED", this.pauseReason);
-		} else if (this.status.name !== "PAUSING") {
-			this.setStatus("PAUSED", this.pauseReason);
+			this.setStatus("PAUSING", this.pauseReason, true, failureRecovery);
+		} else {
+			this.setStatus(this.status.name === "PAUSING" ? "PAUSING" : "PAUSED", this.pauseReason, true, failureRecovery);
 		}
 		this.cancelInFlightCycle();
 	}
@@ -327,7 +325,7 @@ export abstract class ReadJob {
 	private async settleStatusTransitions(): Promise<void> {
 		if (this.status.name === "FAILED" || this.status.name === "STOPPED") return;
 		if (this.status.name === "PAUSING" && !this.cycleRunning) {
-			this.setStatus("PAUSED", this.pauseReason);
+			this.setStatus("PAUSED", this.pauseReason, true, this.status.failureRecovery);
 		} else if (this.status.name === "RESUMING") {
 			this.setStatus("RUNNING");
 			if (this.resetFailuresOnResume) this.resetConsecutiveFailures();
@@ -343,14 +341,14 @@ export abstract class ReadJob {
 		}
 	}
 
-	private setStatus(name: QueryQueueAndJobStatus, info?: string, notify = true): void {
+	private setStatus(name: QueryQueueAndJobStatus, info?: string, notify = true, failureRecovery?: QueryStatus["failureRecovery"]): void {
 		if ((this.status.name === "FAILED" || this.status.name === "STOPPED") && name !== "FAILED" && name !== "STOPPED") return;
-		if (this.status.name === name && this.status.info === info) return;
-		this.status = { name, info: name === "RUNNING" ? undefined : info };
+		if (this.status.name === name && this.status.info === info && this.status.failureRecovery?.retryAt === failureRecovery?.retryAt) return;
+		this.status = { name, info: name === "RUNNING" ? undefined : info, ...(failureRecovery ? { failureRecovery: { ...failureRecovery } } : {}) };
 		this.query.read.status = this.status;
 		if (notify) {
 			const query = snapshotQuery(this.query);
-			const status = { ...this.status };
+			const status = snapshotValue(this.status);
 			this.statusHookChain = this.statusHookChain
 				.then(async () => this.hooks.onQueryStatusChange?.(query, { kind: "read", status }))
 				.catch(() => {});
@@ -389,8 +387,9 @@ export abstract class ReadJob {
 	private async recordReadFailure(error: unknown, source: "read" | "until"): Promise<void> {
 		this.lastFailureSource = source;
 		const failureCount = ++this.consecutiveFailures;
-		if (failureCount >= this.query.read.pauseAfterConsecutiveFailures) {
-			this.requestPause(`Read Job is paused due to ${this.query.read.pauseAfterConsecutiveFailures} consecutive failures`);
+		if (failureCount >= this.query.read.pauseAfterConsecutiveFailures && this.status.name === "RUNNING") {
+			this.requestPause(`Read Job is paused due to ${this.query.read.pauseAfterConsecutiveFailures} consecutive failures`,
+				this.failureRecoveryDelayMs === undefined ? undefined : { retryAt: Date.now() + this.failureRecoveryDelayMs });
 			await this.hooks.onReadConsecutiveFailuresReached?.(this.query, failureCount);
 		}
 
